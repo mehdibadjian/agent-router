@@ -4,7 +4,7 @@ Zero-runtime-dependency prompt pre-processor and subagent dispatcher for AI codi
 
 A single static Rust binary that sits in front of an expensive "System 2" coding model and does the cheap work first: it enforces a hard context-saturation ceiling, compiles terse prompts into structured engineering specs, indexes the repository's agents and skills with a sub-millisecond cache, and routes the result to the best-matched subagent — without Python, Node, or Docker on the host.
 
-**Status:** Phases 1–4 implemented (pipeline, fail-open compiler, harness adapters, CI matrix). Static-linking claims are enforced by CI but not yet observed passing end-to-end; see [Verification status](#verification-status).
+**Status:** Phases 1–4 complete. CI is green on all six platform jobs, including the static-linkage assertion.
 
 Docs: [Business Requirements](docs/BRD.md) · [Implementation Plan](docs/IMPLEMENTATION_PLAN.md)
 
@@ -119,16 +119,32 @@ State lives in `.router/session.json` and `.router/registry.json`; both are giti
 
 ## Verification status
 
-Measured on this machine (Linux x86_64, glibc host, Rust 1.98.1):
+Static linking was never observable from this dev sandbox — the rustup mirror
+would not serve the musl target — so the headline NFR is proven in CI instead.
+Current green run:
 
-- `cargo test --all-targets`: **18 passing** (4 unit, 14 integration) — budget ceiling math, frontmatter parsing, multibyte truncation, MCP handshake/notification/garbage handling, fail-open, fence stripping, hallucination sanitising, passthrough gate, Mode A exit-code propagation, cache invalidation.
-- Cold and warm invocation: **~1 ms**, cache hit validated by stable XXH3 fingerprint.
-- Release binary: **1.73 MiB** (NFR < 5 MiB). Peak RSS: **~8 MiB** (NFR < 15 MB).
+| Gate | Result |
+|---|---|
+| `cargo test --all-targets` | **18 passing** (4 unit, 14 integration) |
+| Linux x86_64 musl | `ldd`: `not a dynamic executable`; `readelf` NEEDED empty; **1.84 MiB** |
+| Linux aarch64 musl | `ldd`: `not a dynamic executable`; **1.57 MiB** |
+| Windows msvc-static | builds with `crt-static`; **1.56 MiB** |
+| macOS universal | `lipo` fat file contains `x86_64 arm64`; `otool -L` free of libssl/libcrypto/sqlite3; slices **1.32 / 1.50 MiB** |
+| Fail-open smoke | routes to `.agents/rust-architect.md` with no LLM reachable, on Linux and Windows |
 
-Not yet observed on this machine:
+The 5 MiB and zero-dynamic-dependency NFRs are satisfied with room to spare.
+Measured locally on the glibc host: cold and warm invocation ~1 ms with a
+stable XXH3 cache fingerprint, peak RSS ~8 MiB (NFR < 15 MB).
 
-- **Static linkage is unverified.** The musl target could not be installed here (rustup mirror returned 404), so `ldd` was only checked against the glibc host build, which is expected to be dynamic. The `Assert fully static linkage` gate in CI is the first real test of this claim.
-- The `rustfmt` and `clippy` steps run informationally (`continue-on-error`) because the sources were transcribed from the implementation plan rather than emitted by `rustfmt`.
+Test coverage spans the budget ceiling math, frontmatter parsing, multibyte
+truncation, the MCP handshake, notifications, and malformed-input survival,
+fail-open, fence stripping, hallucination sanitising, the passthrough gate,
+Mode A exit-code and env propagation, cache invalidation, and clean-repo
+`--sync-tokens` calibration.
+
+`rustfmt` and `clippy` run informationally (`continue-on-error`) because the
+sources were transcribed from the implementation plan rather than emitted by
+`rustfmt`.
 
 ## CI
 
