@@ -44,6 +44,11 @@ pub fn run_pipeline(repo_root: &Path, raw_prompt: &str) -> Result<RouterEnvelope
     );
     budget::save_session(&session_file, &session).map_err(|e| e.to_string())?;
 
+    eprintln!(
+        "[agent-router] prompt_tokens={} projected_saturation={:.3} reset={}",
+        eval.prompt_tokens, eval.saturation_ratio, eval.must_reset_session
+    );
+
     // Step 3: Build Harness-Agnostic Envelope
     Ok(dispatcher::build_envelope(&session, &eval, decision, &registry))
 }
@@ -65,11 +70,28 @@ fn main() {
             }
         }
         "--sync-tokens" => {
-            if let Some(val) = args.get(1).and_then(|s| s.parse::<usize>().ok()) {
-                let session_file = repo_root.join(".router/session.json");
-                let mut session = budget::load_session(&session_file);
-                session.accumulated_tokens = val;
-                let _ = budget::save_session(&session_file, &session);
+            match args.get(1).and_then(|s| s.parse::<usize>().ok()) {
+                Some(val) => {
+                    // The ledger may not exist yet (first calibration before any routed
+                    // turn), so ensure the state directory is present before writing.
+                    let router_dir = repo_root.join(".router");
+                    if let Err(e) = fs::create_dir_all(&router_dir) {
+                        eprintln!("[agent-router] cannot create {}: {}", router_dir.display(), e);
+                        std::process::exit(1);
+                    }
+                    let session_file = router_dir.join("session.json");
+                    let mut session = budget::load_session(&session_file);
+                    session.accumulated_tokens = val;
+                    if let Err(e) = budget::save_session(&session_file, &session) {
+                        eprintln!("[agent-router] failed to persist token ledger: {}", e);
+                        std::process::exit(1);
+                    }
+                    eprintln!("[agent-router] ledger calibrated to {} tokens", val);
+                }
+                None => {
+                    eprintln!("Usage: agent-router --sync-tokens <exact_token_count>");
+                    std::process::exit(1);
+                }
             }
         }
         _ => {
