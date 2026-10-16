@@ -33,12 +33,12 @@ AgentRouter solves this by introducing a harness-agnostic, zero-dependency nativ
 * **Step 0 (Context Circuit Breaker):** Token ledger tracking, configurable harness overhead accounting, 35% saturation enforcement, and automated state-handoff rollups on session reset.
 * **Step 1 (Prompt Compiler):** Integration with any OpenAI-compatible local or cloud endpoint to transform raw user prompts into structured specifications (Objective, Constraints, Context, Verification), plus a passthrough gate for trivial commands.
 * **Step 2 (Capability Registry & Cache):** High-speed filesystem scanner and frontmatter parser for repo-local agents and skills, backed by xxh3 modification-time (mtime) hashing.
-* **Step 3 (Harness-Agnostic Dispatcher):** Dual-mode execution supporting CLI subprocess wrapping, pre-prompt hook interception, and a native JSON-RPC 2.0 Model Context Protocol (MCP) stdio server.
+* **Step 3 (Harness-Agnostic Dispatcher):** Multi-mode execution supporting CLI subprocess wrapping, raw stdout JSON, and a native stdin/stdout lifecycle hook adapter (`--hook`) for VS Code Copilot, Claude Code, and Antigravity (AGY).
 
 ### 3.2 Out-of-Scope
 
 * Building a full "System 2" autonomous coding loop (AgentRouter delegates execution to existing harnesses/subagents).
-* GUI or web dashboard interfaces (strictly CLI, environment variables, and stdio JSON-RPC).
+* GUI or web dashboard interfaces (strictly CLI, environment variables, and stdio hook JSON).
 * External database dependencies (all state is persisted locally in `.router/*.json`).
 
 ## 4. Functional Requirements
@@ -48,7 +48,7 @@ AgentRouter solves this by introducing a harness-agnostic, zero-dependency nativ
 | Req ID | Requirement Description | Priority | Acceptance Criteria |
 |---|---|---|---|
 | FR-0.1 | Zero-Dependency Token Estimation: Estimate token counts for system overhead, session history, injected skills, and the incoming prompt without external C/C++ tokenizers. | P0 | Token count calculation completes in less than 1ms with less than 3% variance against standard BPE (cl100k_base / o200k_base). |
-| FR-0.2 | Configurable Harness Overhead: Account for hidden tokens injected by the underlying harness (system prompts, MCP definitions, rules files). | P0 | Supports `ROUTER_BASE_OVERHEAD_TOKENS` (default: 10000) and `ROUTER_MAX_TOKENS` (default: 128000). |
+| FR-0.2 | Configurable Harness Overhead: Account for hidden tokens injected by the underlying harness (system prompts, tool definitions, rules files). | P0 | Supports `ROUTER_BASE_OVERHEAD_TOKENS` (default: 10000) and `ROUTER_MAX_TOKENS` (default: 128000). |
 | FR-0.3 | 35% Hard Saturation Trigger: Evaluate total projected tokens against `ROUTER_MAX_TOKENS`. If usage exceeds 0.35 (35%), flag the session for mandatory reset. | P0 | Any request pushing cumulative session tokens above 35.0% sets `must_reset_session = true` deterministically. |
 | FR-0.4 | Session Handoff Compression: When a reset is triggered, instruct the low-cost model to compress prior session state into a dense `<session_handoff>` artifact before clearing the ledger. | P0 | New session starts with a clean ledger (`session_id + 1`), resetting accumulated tokens while preserving active file paths, architectural decisions, and pending blockers in under 500 tokens. |
 
@@ -65,18 +65,18 @@ AgentRouter solves this by introducing a harness-agnostic, zero-dependency nativ
 
 | Req ID | Requirement Description | Priority | Acceptance Criteria |
 |---|---|---|---|
-| FR-2.1 | Multi-Convention Directory Discovery: Scan standard repository paths (`.agents/`, `.claude/agents/`, `skills/`, `.cursor/rules/`) while respecting `.gitignore`. | P0 | Discovers all `.md` and `.yaml` agent/skill manifests across nested directories. |
-| FR-2.2 | Frontmatter & Header Extraction: Parse only the YAML frontmatter (name, description, triggers) or top 15 lines of each manifest so full skill bodies do not bloat the router's prompt. | P0 | Registry index stays under 1,000 tokens even in repositories with 50+ skills and subagents. |
+| FR-2.1 | Multi-Convention Directory Discovery: Scan standard repository paths (`.agents/`, `.claude/agents/`, `.github/agents/`, `skills/`, `.claude/skills/`, `.github/skills/`). | P0 | Discovers all `.md` agent/skill manifests across nested directories. |
+| FR-2.2 | Frontmatter & Header Extraction: Parse only the YAML frontmatter (name, description, triggers) or top lines of each manifest so full skill bodies do not bloat the router's prompt. | P0 | Registry index stays under 1,000 tokens even in repositories with 50+ skills and subagents. |
 | FR-2.3 | Content-Addressable Mtime Caching: Compute a 64-bit XXH3 hash of all discovered file paths and nanosecond modification timestamps (mtime). | P0 | If no agent/skill files have changed since the last invocation, `.router/registry.json` is loaded from disk in less than 2ms with zero file re-parsing. |
 
 ### 4.4 Module 3: Harness-Agnostic Subagent Dispatcher
 
 | Req ID | Requirement Description | Priority | Acceptance Criteria |
 |---|---|---|---|
-| FR-3.1 | Subagent & Skill Matching: Select the single most qualified `target_subagent` and an array of `required_skills` based on the compiled prompt and cached registry. | P0 | Router outputs valid paths/IDs matching the cached registry; falls back to `default_generalist` if no specialized agent matches. |
-| FR-3.2 | Adapter Mode A — CLI Wrapper / Subprocess Spawner: Spawn any target CLI harness (claude, aider, codex, opencode, custom scripts) passing the compiled prompt, target subagent, and session reset flags. | P0 | Properly forwards stdin/stdout/stderr, injects environment variables (`ROUTED_SUBAGENT`, `ROUTED_SKILLS`, `ROUTED_SESSION_RESET`), and propagates exit codes. |
-| FR-3.3 | Adapter Mode B — Stdout Hook Contract: Emit a deterministic JSON payload to stdout when no harness binary is specified, enabling integration with pre-prompt hooks. | P0 | Outputs clean, parseable JSON to stdout while routing all diagnostic logs strictly to stderr. |
-| FR-3.4 | Adapter Mode C — Native MCP Stdio Server: Run as a long-lived JSON-RPC 2.0 server via `agent-router --mcp`, exposing a `route_and_compile` tool to any MCP client. | P1 | Passes MCP Inspector handshake and tool invocation checks without external runtime dependencies. |
+| FR-3.1 | Subagent & Skill Matching: Select the single most qualified `target_subagent` and an array of `required_skills` based on the compiled prompt and cached registry. | P0 | Router outputs valid paths/IDs matching the cached registry; falls back to `default` if no specialized agent matches. |
+| FR-3.2 | Adapter Mode A — CLI Wrapper / Subprocess Spawner: Spawn any target CLI harness (claude, agy, aider, codex, opencode, custom scripts) passing the compiled prompt, target subagent, and session reset flags. | P0 | Properly forwards stdin/stdout/stderr, injects environment variables (`ROUTED_SUBAGENT`, `ROUTED_SKILLS`, `ROUTED_SESSION_ACTION`), and propagates exit codes. |
+| FR-3.3 | Adapter Mode B — Stdout JSON Contract: Emit a deterministic JSON payload to stdout when invoked with a prompt argument and no harness binary, enabling custom scripts. | P0 | Outputs clean, parseable JSON to stdout while routing all diagnostic logs strictly to stderr. |
+| FR-3.4 | Adapter Mode C — Native Lifecycle Hook Adapter: Run via `agent-router --hook`, reading hook stdin JSON and outputting harness-native context injection (`hookSpecificOutput.additionalContext` for VS Code Copilot & Claude Code; `injectSteps` for Antigravity). | P0 | Zero-config drop-in hook for `.github/hooks/*.json`, `.claude/settings.json`, and `.agents/hooks.json`; fails open with `{}` on malformed input. |
 
 ## 5. Non-Functional Requirements (NFRs)
 
@@ -87,7 +87,7 @@ AgentRouter solves this by introducing a harness-agnostic, zero-dependency nativ
   * Release binary size must remain under 5 MB (stripped with LTO enabled).
   * Peak resident memory (RSS) during execution must remain under 15 MB.
 * **Graceful Degradation (Fail-Open Resilience):**
-  * If the low-cost LLM endpoint (e.g., local Ollama or cloud API) is unreachable or times out (configurable timeout default: 3,000ms), the binary must fail open: it logs a warning to stderr, performs heuristic keyword matching against the cached registry, enforces the 35% token check locally, and dispatches the raw prompt so developer workflow is never blocked.
+  * If the low-cost LLM endpoint (e.g., local Ollama or cloud API) is unreachable or times out (configurable timeout default: 3,000ms), the binary must fail open: it logs a warning to stderr, performs heuristic keyword matching against the cached registry, enforces the 35% token check locally, and dispatches the prompt so developer workflow is never blocked.
 * **Security & Credential Hygiene:**
   * API keys (`ROUTER_LLM_KEY`) are read strictly from environment variables or OS keychain paths and are never written to `.router/` state files or command-line process arguments (`ps aux` safe).
 
@@ -96,7 +96,7 @@ AgentRouter solves this by introducing a harness-agnostic, zero-dependency nativ
 ### 6.1 End-to-End Execution Flow
 
 ```
-[User Raw Prompt]
+[User Raw Prompt / Hook Stdin]
        │
        ▼
 ┌─────────────────────────────────────────────────────────────┐
@@ -125,19 +125,19 @@ AgentRouter solves this by introducing a harness-agnostic, zero-dependency nativ
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │ Step 3: Harness-Agnostic Dispatcher                   │  │
 │  │ • Updates .router/session.json                        │  │
-│  │ • Dispatches via CLI Wrapper, Hook JSON, or MCP Stdio │  │
+│  │ • Dispatches via CLI Wrapper, Raw JSON, or --hook     │  │
 │  └───────────────────────────────────────────────────────┘  │
 └─────────────────────────────┬───────────────────────────────┘
                               │
         ┌─────────────────────┼─────────────────────┐
         ▼                     ▼                     ▼
- [CLI Subprocess]     [Pre-Prompt Hook]     [MCP JSON-RPC Client]
- (Claude / Custom)   (Cursor / Windsurf)    (LangGraph / PydanticAI)
+ [CLI Subprocess]     [Stdout Envelope]     [Lifecycle Hooks]
+ (Claude / AGY CLI)    (Custom Scripts)    (Copilot / Claude / AGY)
 ```
 
 ### 6.2 Core JSON Output Contract
 
-Whether consumed via stdout hook or MCP tool response, the router guarantees the following payload structure:
+When consumed via stdout (`agent-router "<prompt>"`), the router guarantees the following payload structure (which `--hook` formats into `hookSpecificOutput.additionalContext` or `injectSteps`):
 
 ```json
 {
@@ -156,8 +156,8 @@ Whether consumed via stdout hook or MCP tool response, the router guarantees the
     ]
   },
   "payload": {
-    "context_handoff_summary": "Completed Step 0 token estimator and XXH3 registry cache. Pending: JSON-RPC stdio loop implementation in src/mcp.rs.",
-    "compiled_prompt": "<objective>\nImplement the synchronous JSON-RPC 2.0 stdio server loop in `src/mcp.rs`.\n</objective>\n<constraints>\n- Zero async runtime dependencies (use `std::io::BufRead` only).\n- Must handle `initialize`, `tools/list`, and `tools/call` methods.\n</constraints>\n<verification>\nRun `cargo test --test mcp_handshake` and verify zero compiler warnings.\n</verification>"
+    "context_handoff_summary": "Completed Step 0 token estimator and XXH3 registry cache. Pending: lifecycle hook adapter in src/hook.rs.",
+    "compiled_prompt": "<objective>\nImplement the synchronous stdin/stdout lifecycle hook adapter in `src/hook.rs`.\n</objective>\n<constraints>\n- Zero async runtime dependencies.\n- Must support VS Code Copilot, Claude Code, and Antigravity hook schemas.\n</constraints>\n<verification>\nRun `cargo test --test hooks` and verify zero compiler warnings.\n</verification>"
   }
 }
 ```
@@ -177,7 +177,7 @@ Whether consumed via stdout hook or MCP tool response, the router guarantees the
   * Implement CLI argument parser, `.router/` state management, Step 0 token heuristic calculator (35% trigger), and Step 2 xxh3 mtime registry scanner with YAML frontmatter extraction.
 * **Phase 2: Prompt Compiler & Fail-Open HTTP Client (Milestone 2)**
   * Implement pure-Rust ureq + rustls OpenAI-compatible client, deterministic meta-prompt templates, JSON schema validation, and fail-open fallback logic.
-* **Phase 3: Harness Adapters & MCP Server Mode (Milestone 3)**
-  * Implement subprocess wrapper mode (`ROUTER_HARNESS_BIN`), hook stdout mode, and synchronous JSON-RPC 2.0 `--mcp` stdio mode.
+* **Phase 3: Harness Adapters & Native Hook Mode (Milestone 3)**
+  * Implement subprocess wrapper mode (`ROUTER_HARNESS_BIN`), raw stdout envelope mode, and native lifecycle hook mode (`--hook`) for VS Code Copilot, Claude Code, and Antigravity.
 * **Phase 4: Zero-Dependency CI/CD Matrix (Milestone 4)**
   * Configure GitHub Actions workflow using `GITHUB_TOKEN` to build, strip, and publish static binaries across Linux (musl), macOS (Universal), and Windows (msvc-static).

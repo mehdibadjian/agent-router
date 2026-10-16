@@ -9,8 +9,10 @@ use xxhash_rust::xxh3::xxh3_64;
 const SEARCH_DIRS: &[(&str, &str)] = &[
     (".agents", "agent"),
     (".claude/agents", "agent"),
+    (".github/agents", "agent"),
     ("skills", "skill"),
     (".claude/skills", "skill"),
+    (".github/skills", "skill"),
 ];
 
 pub fn load_or_build_registry(
