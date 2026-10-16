@@ -12,9 +12,9 @@ This Zero-Hallucination Implementation Plan is structured as an execution-ready 
 Any coding agent executing this specification MUST obey these five hard rules:
 
 * **Strict Crate Lock:** Only the 5 crates in `Cargo.toml` are permitted (`serde`, `serde_json`, `ureq`, `xxhash-rust`, `walkdir`). Do not add `clap`, `tokio`, `reqwest`, `anyhow`, `regex`, or `serde_yaml`.
-* **Synchronous I/O Only:** All HTTP, filesystem, and stdin/stdout JSON-RPC operations must use blocking standard library I/O (`std::io`, `std::fs`, `ureq`).
+* **Synchronous I/O Only:** All HTTP, filesystem, and stdin/stdout hook JSON operations must use blocking standard library I/O (`std::io`, `std::fs`, `ureq`).
 * **Pure-Rust TLS:** `ureq` v2.10 must be configured with `default-features = false` and `features = ["tls", "json"]` so it compiles `rustls` statically without linking system OpenSSL.
-* **Stdout Purity:** Never use `println!` for logging or diagnostics—stdout is strictly reserved for the JSON routing contract and MCP JSON-RPC responses. All warnings/logs must use `eprintln!`.
+* **Stdout Purity:** Never use `println!` for logging or diagnostics—stdout is strictly reserved for the JSON routing contract and lifecycle hook responses. All warnings/logs must use `eprintln!`.
 * **Fail-Open Mandate:** Network timeouts, malformed LLM JSON, or missing API keys must never panic or crash the binary; they must fall back deterministically to `FallbackDecision`.
 
 ## 2. Repository Directory Layout
@@ -30,8 +30,8 @@ agent-router/
     ├── budget.rs          # Step 0: Token estimator & 35% circuit breaker
     ├── registry.rs        # Step 2: XXH3 mtime scanner & frontmatter parser
     ├── compiler.rs        # Step 1: Low-cost LLM client, prompt compiler & fail-open fallback
-    ├── dispatcher.rs      # Step 3: CLI subprocess spawner & stdout hook emitter
-    └── mcp.rs             # Step 3 (Mode C): Synchronous JSON-RPC 2.0 MCP server loop
+    ├── dispatcher.rs      # Step 3: CLI subprocess spawner & stdout JSON emitter
+    └── hook.rs            # Step 3 (Mode C): Synchronous lifecycle hook adapter (--hook)
 ```
 
 ## 3. Configuration & Build Manifests
@@ -124,7 +124,7 @@ pub struct LlmCompilerOutput {
     pub context_handoff_summary: Option<String>,
 }
 
-/// Final deterministic payload emitted to stdout or MCP client
+/// Final deterministic payload emitted to stdout or formatted for lifecycle hooks
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RouterEnvelope {
     pub session_meta: SessionMeta,
@@ -281,8 +281,10 @@ use xxhash_rust::xxh3::xxh3_64;
 const SEARCH_DIRS: &[(&str, &str)] = &[
     (".agents", "agent"),
     (".claude/agents", "agent"),
+    (".github/agents", "agent"),
     ("skills", "skill"),
     (".claude/skills", "skill"),
+    (".github/skills", "skill"),
 ];
 
 pub fn load_or_build_registry(
@@ -761,104 +763,154 @@ pub fn execute_dispatch(envelope: &RouterEnvelope) -> Result<i32, String> {
 }
 ```
 
-### File 8: `src/mcp.rs` (Step 3 Mode C: Zero-Dependency JSON-RPC 2.0 MCP Server)
+### File 8: `src/hook.rs` (Step 3 Mode C: Zero-Dependency Lifecycle Hook Adapter)
 
-Implements the Model Context Protocol over stdin/stdout using purely synchronous `std::io::BufRead` so any MCP-capable harness can call `route_and_compile` natively.
+Implements synchronous stdin/stdout lifecycle hook handling (`agent-router --hook`) for VS Code GitHub Copilot, Claude Code, and Antigravity (AGY).
 
 ```rust
 use crate::run_pipeline;
+use crate::types::RouterEnvelope;
 use serde_json::{json, Value};
-use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::fs;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
-pub fn run_mcp_stdio_loop(repo_root: &Path) -> io::Result<()> {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+/// Format the [`RouterEnvelope`] into a concise context block injected by hooks.
+pub fn format_hook_context(envelope: &RouterEnvelope) -> String {
+    let mut sections = Vec::new();
 
-    for line_res in stdin.lock().lines() {
-        let line = line_res?;
-        if line.trim().is_empty() {
+    sections.push(format!(
+        "<router_meta session_id=\"{}\" saturation=\"{:.3}\" action=\"{}\" subagent=\"{}\" subagent_path=\"{}\" skills=\"{}\" passthrough=\"{}\" />",
+        envelope.session_meta.session_id,
+        envelope.session_meta.saturation_ratio,
+        envelope.session_meta.action,
+        envelope.routing.target_subagent,
+        envelope.routing.target_subagent_path,
+        envelope.routing.required_skills.join(","),
+        envelope.routing.passthrough,
+    ));
+
+    if let Some(handoff) = &envelope.payload.context_handoff_summary {
+        if envelope.session_meta.threshold_exceeded {
+            sections.push(format!("<session_handoff>\n{}\n</session_handoff>", handoff));
+        }
+    }
+
+    sections.push(envelope.payload.compiled_prompt.clone());
+    sections.join("\n\n")
+}
+
+/// Extract the latest user prompt from an Antigravity JSONL transcript if present.
+fn extract_prompt_from_transcript(transcript_path: &str) -> Option<String> {
+    let content = fs::read_to_string(transcript_path).ok()?;
+    for line in content.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-
-        let req: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let id = req.get("id").cloned().unwrap_or(Value::Null);
-        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-
-        // Notifications (no "id") do not receive a response in JSON-RPC 2.0
-        if req.get("id").is_none() {
-            continue;
-        }
-
-        let response = match method {
-            "initialize" => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "agent-router", "version": "0.1.0" }
-                }
-            }),
-            "tools/list" => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "tools": [{
-                        "name": "route_and_compile",
-                        "description": "Enforces 35% context ceiling, compiles raw prompt into XML engineering spec, and selects optimal repo subagent and skills.",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "prompt": { "type": "string", "description": "Raw user prompt" }
-                            },
-                            "required": ["prompt"]
-                        }
-                    }]
-                }
-            }),
-            "tools/call" => {
-                let raw_prompt = req
-                    .pointer("/params/arguments/prompt")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-
-                match run_pipeline(repo_root, raw_prompt) {
-                    Ok(envelope) => {
-                        let text = serde_json::to_string_pretty(&envelope).unwrap_or_default();
-                        json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "content": [{ "type": "text", "text": text }],
-                                "isError": false
-                            }
-                        })
-                    }
-                    Err(e) => json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{ "type": "text", "text": e }],
-                            "isError": true
-                        }
-                    }),
+        let entry: Value = serde_json::from_str(trimmed).ok()?;
+        let is_user_input = entry
+            .get("type")
+            .and_then(|t| t.as_str())
+            .map(|t| t == "USER_INPUT")
+            .unwrap_or(false);
+        if is_user_input {
+            if let Some(text) = entry.get("content").and_then(|c| c.as_str()) {
+                if !text.trim().is_empty() {
+                    return Some(text.to_string());
                 }
             }
-            _ => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32601, "message": "Method not found" }
-            }),
-        };
-
-        writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
-        stdout.flush()?;
+        }
     }
+    None
+}
+
+fn is_agy_hook(input: &Value) -> bool {
+    input.get("invocationNum").is_some()
+        || input.get("workspacePaths").is_some()
+        || input.get("transcriptPath").is_some()
+        || input.get("conversationId").is_some()
+}
+
+pub fn run_stdio_hook(default_repo_root: &Path) -> io::Result<()> {
+    let mut raw_input = String::new();
+    io::stdin().read_to_string(&mut raw_input)?;
+
+    let mut stdout = io::stdout();
+    let trimmed = raw_input.trim();
+    if trimmed.is_empty() {
+        writeln!(stdout, "{{}}")?;
+        stdout.flush()?;
+        return Ok(());
+    }
+
+    let req: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => {
+            writeln!(stdout, "{{}}")?;
+            stdout.flush()?;
+            return Ok(());
+        }
+    };
+
+    let repo_root: PathBuf = req
+        .get("cwd")
+        .and_then(|c| c.as_str())
+        .or_else(|| req.pointer("/workspacePaths/0").and_then(|p| p.as_str()))
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| default_repo_root.to_path_buf());
+
+    let raw_prompt = req
+        .get("prompt")
+        .and_then(|p| p.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            req.get("transcriptPath")
+                .and_then(|t| t.as_str())
+                .and_then(extract_prompt_from_transcript)
+        })
+        .unwrap_or_default();
+
+    if raw_prompt.trim().is_empty() {
+        writeln!(stdout, "{{}}")?;
+        stdout.flush()?;
+        return Ok(());
+    }
+
+    let response = match run_pipeline(&repo_root, &raw_prompt) {
+        Ok(envelope) => {
+            let context = format_hook_context(&envelope);
+            if is_agy_hook(&req) {
+                json!({
+                    "injectSteps": [
+                        {
+                            "ephemeralMessage": context
+                        }
+                    ]
+                })
+            } else {
+                let event_name = req
+                    .get("hook_event_name")
+                    .or_else(|| req.get("hookEventName"))
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("UserPromptSubmit");
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": event_name,
+                        "additionalContext": context
+                    }
+                })
+            }
+        }
+        Err(e) => {
+            eprintln!("[agent-router] Hook pipeline error (failing open): {}", e);
+            json!({})
+        }
+    };
+
+    writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+    stdout.flush()?;
     Ok(())
 }
 ```
@@ -869,7 +921,7 @@ pub fn run_mcp_stdio_loop(repo_root: &Path) -> io::Result<()> {
 mod budget;
 mod compiler;
 mod dispatcher;
-mod mcp;
+mod hook;
 mod registry;
 mod types;
 
@@ -926,22 +978,20 @@ fn main() {
     let repo_root = env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
 
     if args.is_empty() {
-        eprintln!("Usage:\n  agent-router \"<raw_prompt>\"\n  agent-router --mcp\n  agent-router --sync-tokens <exact_token_count>");
+        eprintln!("Usage:\n  agent-router \"<raw_prompt>\"\n  agent-router --hook\n  agent-router --sync-tokens <exact_token_count>");
         std::process::exit(1);
     }
 
     match args[0].as_str() {
-        "--mcp" => {
-            if let Err(e) = mcp::run_mcp_stdio_loop(&repo_root) {
-                eprintln!("[agent-router] MCP loop error: {}", e);
+        "--hook" => {
+            if let Err(e) = hook::run_stdio_hook(&repo_root) {
+                eprintln!("[agent-router] Hook error: {}", e);
                 std::process::exit(1);
             }
         }
         "--sync-tokens" => {
             match args.get(1).and_then(|s| s.parse::<usize>().ok()) {
                 Some(val) => {
-                    // The ledger may not exist yet (first calibration before any routed
-                    // turn), so ensure the state directory is present before writing.
                     let router_dir = repo_root.join(".router");
                     if let Err(e) = fs::create_dir_all(&router_dir) {
                         eprintln!("[agent-router] cannot create {}: {}", router_dir.display(), e);
@@ -1020,12 +1070,12 @@ cargo run -- "implement next module"
 
 Confirm `session_meta.threshold_exceeded` is `true`, `session_meta.action` is `"START_NEW_SESSION"`, and `session_meta.session_id` increments to `2`.
 
-### 4. Verify MCP JSON-RPC Handshake
+### 4. Verify Lifecycle Hook Execution (`--hook`)
 
-> Pipe an MCP `tools/list` request directly to `--mcp` mode:
+> Pipe a `UserPromptSubmit` hook payload directly to `--hook` mode:
 
 ```bash
-printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' | cargo run -- --mcp
+printf '{"hook_event_name":"UserPromptSubmit","prompt":"fix rust lifetime in parser and add test"}\n' | cargo run -- --hook
 ```
 
-Confirm a single-line JSON-RPC 2.0 response containing the `route_and_compile` tool schema.
+Confirm a single-line JSON response containing `hookSpecificOutput.additionalContext` with `<router_meta ... />` and `<objective>`.
