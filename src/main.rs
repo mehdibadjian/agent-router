@@ -1,7 +1,7 @@
 mod budget;
 mod compiler;
 mod dispatcher;
-mod mcp;
+mod hook;
 mod registry;
 mod types;
 
@@ -58,14 +58,14 @@ fn main() {
     let repo_root = env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
 
     if args.is_empty() {
-        eprintln!("Usage:\n  agent-router \"<raw_prompt>\"\n  agent-router --mcp\n  agent-router --sync-tokens <exact_token_count>");
+        eprintln!("Usage:\n  agent-router \"<raw_prompt>\"\n  agent-router --hook\n  agent-router --sync-tokens <exact_token_count>");
         std::process::exit(1);
     }
 
     match args[0].as_str() {
-        "--mcp" => {
-            if let Err(e) = mcp::run_mcp_stdio_loop(&repo_root) {
-                eprintln!("[agent-router] MCP loop error: {}", e);
+        "--hook" => {
+            if let Err(e) = hook::run_stdio_hook(&repo_root) {
+                eprintln!("[agent-router] Hook error: {}", e);
                 std::process::exit(1);
             }
         }

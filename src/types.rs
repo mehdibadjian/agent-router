@@ -43,7 +43,7 @@ pub struct LlmCompilerOutput {
     pub context_handoff_summary: Option<String>,
 }
 
-/// Final deterministic payload emitted to stdout or MCP client
+/// Final deterministic payload emitted to stdout or formatted for lifecycle hooks
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RouterEnvelope {
     pub session_meta: SessionMeta,
