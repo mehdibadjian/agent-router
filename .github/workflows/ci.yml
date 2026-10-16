@@ -83,13 +83,21 @@ jobs:
         run: |
           set -euo pipefail
           BIN="target/${{ matrix.target }}/release/agent-router"
+          # ldd exits non-zero when it reports a static binary, so capture its
+          # output rather than relying on the pipeline status under pipefail.
+          OUT="$(ldd "$BIN" 2>&1 || true)"
           echo "--- ldd ---"
-          ldd "$BIN" 2>&1 || true
+          echo "$OUT"
           echo "-----------"
-          if ldd "$BIN" 2>&1 | grep -qiE "not a dynamic executable|statically linked"; then
-            echo "OK: no dynamic dependencies"
-          else
-            echo "FAIL: binary is dynamically linked"
+          case "$OUT" in
+            *"not a dynamic executable"* | *"statically linked"*)
+              echo "OK: no dynamic dependencies" ;;
+            *)
+              echo "FAIL: binary is dynamically linked"
+              exit 1 ;;
+          esac
+          if echo "$OUT" | grep -qE '\.so'; then
+            echo "FAIL: shared objects listed by ldd"
             exit 1
           fi
 
