@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": "./target/release/agent-router --hook",
+        "timeout": 5000
+      }
+    ]
+  }
+}

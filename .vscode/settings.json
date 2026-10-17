@@ -1,0 +1,4 @@
+{
+  "chat.useHooks": true,
+  "chat.customAgentInSubagent.enabled": true
+}

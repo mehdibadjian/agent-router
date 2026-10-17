@@ -27,6 +27,11 @@ fn copilot_and_claude_user_prompt_submit_hook_emits_additional_context() {
     assert_eq!(code, 0);
 
     let resp: Value = serde_json::from_str(stdout.trim()).expect("valid hook JSON output");
+    assert_eq!(resp["continue"], true);
+    assert!(resp["systemMessage"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("⚡ AgentRouter ["));
     assert_eq!(
         resp["hookSpecificOutput"]["hookEventName"],
         "UserPromptSubmit"
@@ -37,8 +42,9 @@ fn copilot_and_claude_user_prompt_submit_hook_emits_additional_context() {
     assert!(ctx.contains("subagent=\"rust-architect\""));
     assert!(ctx.contains("skills=\"skills/tdd/SKILL.md\""));
     assert!(ctx.contains("<routing_directive>"));
-    assert!(ctx.contains("MANDATORY SUBAGENT: Delegate execution to subagent `rust-architect`"));
-    assert!(ctx.contains("MANDATORY SKILLS: Load and follow the skill instructions at: `skills/tdd/SKILL.md`"));
+    assert!(ctx.contains("MANDATORY SUBAGENT DELEGATION: You MUST delegate this task to the custom agent `rust-architect`"));
+    assert!(ctx.contains("runSubagent"));
+    assert!(ctx.contains("MANDATORY SKILLS: Before writing code, read and follow the skill instructions at: `skills/tdd/SKILL.md`"));
     assert!(ctx.contains("<objective>"));
 }
 
@@ -83,7 +89,8 @@ fn hook_blocks_and_saves_handoff_when_ceiling_exceeded_then_injects_on_new_sessi
     assert_eq!(code, 0);
 
     let stdin_payload = json!({
-        "hook_event_name": "UserPromptSubmit",
+        "hookEventName": "UserPromptSubmit",
+        "sessionId": "vscode-session-1",
         "cwd": repo,
         "prompt": "implement rust parser"
     })
@@ -93,11 +100,16 @@ fn hook_blocks_and_saves_handoff_when_ceiling_exceeded_then_injects_on_new_sessi
     assert_eq!(code, 0);
 
     let resp: Value = serde_json::from_str(stdout.trim()).expect("valid hook JSON");
+    assert_eq!(resp["continue"], false);
     assert_eq!(resp["decision"], "block");
+    assert!(resp["stopReason"]
+        .as_str()
+        .unwrap_or_default()
+        .contains(">35% ceiling"));
     assert!(resp["reason"]
         .as_str()
         .unwrap_or_default()
-        .contains(">35% hard ceiling"));
+        .contains(">35% ceiling"));
     let ctx = resp["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .expect("additionalContext string");
@@ -111,10 +123,10 @@ fn hook_blocks_and_saves_handoff_when_ceiling_exceeded_then_injects_on_new_sessi
         "HANDOFF.md must be written when >35% reset triggers"
     );
 
-    // Next turn on a fresh host session (`session_id` changed after `/clear`) consumes HANDOFF.md
+    // Next turn on a fresh host session (`session_id` changed after `/clear` or New Chat `+`) consumes HANDOFF.md
     let fresh_payload = json!({
         "hook_event_name": "UserPromptSubmit",
-        "session_id": "fresh-session-2",
+        "sessionId": "fresh-session-2",
         "cwd": repo,
         "prompt": "implement rust parser"
     })
@@ -123,6 +135,7 @@ fn hook_blocks_and_saves_handoff_when_ceiling_exceeded_then_injects_on_new_sessi
     let (stdout2, _stderr2, code2) = run(&repo, &["--hook"], OFFLINE, Some(&fresh_payload));
     assert_eq!(code2, 0);
     let resp2: Value = serde_json::from_str(stdout2.trim()).expect("valid hook JSON");
+    assert_eq!(resp2["continue"], true);
     assert!(resp2.get("decision").is_none(), "fresh session must not block");
     let ctx2 = resp2["hookSpecificOutput"]["additionalContext"]
         .as_str()
@@ -163,6 +176,7 @@ fn transcript_path_token_measurement_triggers_ceiling_without_manual_sync() {
     assert_eq!(code, 0);
 
     let resp: Value = serde_json::from_str(stdout.trim()).expect("valid hook JSON");
+    assert_eq!(resp["continue"], false);
     assert_eq!(resp["decision"], "block");
     let ctx = resp["hookSpecificOutput"]["additionalContext"]
         .as_str()
@@ -176,9 +190,10 @@ fn github_agents_and_skills_directories_are_discovered() {
     std::fs::create_dir_all(format!("{}/.github/agents", repo)).unwrap();
     std::fs::create_dir_all(format!("{}/.github/skills/gh-actions", repo)).unwrap();
 
+    // Omit `name:` in frontmatter to verify `.agent.md` double-extension stripping
     std::fs::write(
-        format!("{}/.github/agents/ci-bot.md", repo),
-        "---\nname: ci-bot\ndescription: GitHub Actions specialist\ntriggers: [workflow, pipeline]\n---\n",
+        format!("{}/.github/agents/ci-bot.agent.md", repo),
+        "---\ndescription: GitHub Actions specialist\ntriggers: [workflow, pipeline]\n---\n",
     )
     .unwrap();
     std::fs::write(

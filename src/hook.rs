@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-/// Format the [`RouterEnvelope`] into an imperative context block that forces subagent & skill usage.
+/// Format the [`RouterEnvelope`] into an imperative context block optimized for VS Code Copilot (`runSubagent`) and Claude Code.
 pub fn format_hook_context(envelope: &RouterEnvelope) -> String {
     let mut sections = Vec::new();
 
@@ -21,18 +21,19 @@ pub fn format_hook_context(envelope: &RouterEnvelope) -> String {
         envelope.routing.passthrough,
     ));
 
-    // Imperative routing directive so the host harness actually delegates to the subagent & skills
+    // Imperative routing directive tailored for VS Code Copilot `runSubagent` + Claude Code `Task`
     if envelope.routing.target_subagent != "default" || !envelope.routing.required_skills.is_empty() {
         let mut directives = Vec::new();
         if envelope.routing.target_subagent != "default" {
             directives.push(format!(
-                "- MANDATORY SUBAGENT: Delegate execution to subagent `{}` (defined at `{}`).",
-                envelope.routing.target_subagent, envelope.routing.target_subagent_path
+                "- MANDATORY SUBAGENT DELEGATION: You MUST delegate this task to the custom agent `{name}` (defined at `{path}`). In VS Code Copilot, invoke the `runSubagent` (`agent/runSubagent`) tool with `agentName: \"{name}\"` and pass the `<objective>`, `<constraints>`, and `<verification>` blocks below as its `prompt`. If `runSubagent` is unavailable, read `{path}` first and strictly adopt its persona and constraints.",
+                name = envelope.routing.target_subagent,
+                path = envelope.routing.target_subagent_path
             ));
         }
         if !envelope.routing.required_skills.is_empty() {
             directives.push(format!(
-                "- MANDATORY SKILLS: Load and follow the skill instructions at: `{}`.",
+                "- MANDATORY SKILLS: Before writing code, read and follow the skill instructions at: `{}`.",
                 envelope.routing.required_skills.join("`, `")
             ));
         }
@@ -60,7 +61,6 @@ fn extract_prompt_from_transcript(transcript_path: &str) -> Option<String> {
         if trimmed.is_empty() {
             continue;
         }
-        // Use `let Ok(...) else { continue }` so a single malformed line doesn't abort the scan
         let Ok(entry) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
@@ -80,7 +80,7 @@ fn extract_prompt_from_transcript(transcript_path: &str) -> Option<String> {
     None
 }
 
-/// Estimate real session token usage directly from the harness transcript file if provided.
+/// Estimate real session token usage directly from the harness transcript file (`transcript_path` in VS Code / Claude).
 fn estimate_transcript_tokens(req: &Value) -> Option<usize> {
     let path_str = req
         .get("transcript_path")
@@ -91,17 +91,15 @@ fn estimate_transcript_tokens(req: &Value) -> Option<usize> {
     Some(estimate_tokens(&content))
 }
 
-/// Extract the host harness's native session/conversation ID to detect `/clear` or new sessions.
+/// Extract the host harness's native session ID (`sessionId` in VS Code, `session_id` in Claude/Copilot CLI).
 fn extract_host_session_id(req: &Value) -> Option<String> {
-    req.get("session_id")
-        .or_else(|| req.get("sessionId"))
+    req.get("sessionId")
+        .or_else(|| req.get("session_id"))
         .or_else(|| req.get("conversationId"))
         .and_then(|s| s.as_str())
         .map(|s| s.to_string())
 }
 
-/// Detect whether the hook input came from Antigravity (`PreInvocation` / `SessionStart`)
-/// vs. VS Code Copilot / Claude Code (`UserPromptSubmit`).
 fn is_agy_hook(input: &Value) -> bool {
     input.get("invocationNum").is_some()
         || input.get("workspacePaths").is_some()
@@ -109,12 +107,6 @@ fn is_agy_hook(input: &Value) -> bool {
         || input.get("conversationId").is_some()
 }
 
-/// Execute hook mode: read a JSON payload from stdin, run the router pipeline,
-/// and emit the harness-appropriate hook response JSON to stdout.
-///
-/// Supports:
-/// - VS Code GitHub Copilot & Claude Code (`UserPromptSubmit` -> `hookSpecificOutput.additionalContext`)
-/// - Antigravity / AGY (`PreInvocation` -> `injectSteps[].ephemeralMessage`)
 pub fn run_stdio_hook(default_repo_root: &Path) -> io::Result<()> {
     let mut raw_input = String::new();
     io::stdin().read_to_string(&mut raw_input)?;
@@ -130,14 +122,12 @@ pub fn run_stdio_hook(default_repo_root: &Path) -> io::Result<()> {
     let req: Value = match serde_json::from_str(trimmed) {
         Ok(v) => v,
         Err(_) => {
-            // Never block the host harness on malformed hook input (fail-open).
             writeln!(stdout, "{{}}")?;
             stdout.flush()?;
             return Ok(());
         }
     };
 
-    // Resolve workspace root from payload (`cwd` for Copilot/Claude, `workspacePaths[0]` for AGY)
     let repo_root: PathBuf = req
         .get("cwd")
         .and_then(|c| c.as_str())
@@ -146,7 +136,6 @@ pub fn run_stdio_hook(default_repo_root: &Path) -> io::Result<()> {
         .filter(|p| p.exists())
         .unwrap_or_else(|| default_repo_root.to_path_buf());
 
-    // Extract prompt from `prompt` field or fallback to AGY `transcriptPath`
     let raw_prompt = req
         .get("prompt")
         .and_then(|p| p.as_str())
@@ -176,26 +165,39 @@ pub fn run_stdio_hook(default_repo_root: &Path) -> io::Result<()> {
         Ok(envelope) => {
             let context = format_hook_context(&envelope);
             if is_agy_hook(&req) {
+                let agy_msg = if envelope.session_meta.threshold_exceeded {
+                    format!(
+                        "<circuit_breaker_alert>\nSTOP: Context saturation reached {:.1}% (>35% hard ceiling). State handoff saved to `.router/HANDOFF.md`. Start a new conversation.\n</circuit_breaker_alert>\n\n{}",
+                        envelope.session_meta.saturation_ratio * 100.0,
+                        context
+                    )
+                } else {
+                    context
+                };
                 json!({
                     "injectSteps": [
                         {
-                            "ephemeralMessage": context
+                            "ephemeralMessage": agy_msg
                         }
                     ]
                 })
             } else if envelope.session_meta.threshold_exceeded {
                 let event_name = req
-                    .get("hook_event_name")
-                    .or_else(|| req.get("hookEventName"))
+                    .get("hookEventName")
+                    .or_else(|| req.get("hook_event_name"))
                     .and_then(|e| e.as_str())
                     .unwrap_or("UserPromptSubmit");
-                // Hard Circuit Breaker: Block the bloated session turn and surface the handoff
+                let stop_msg = format!(
+                    "⚡ AgentRouter Circuit Breaker: Context reached {:.1}% (>35% ceiling). State handoff & compiled prompt saved to .router/HANDOFF.md. Click '+' (New Chat) or run `/clear` and re-submit your prompt.",
+                    envelope.session_meta.saturation_ratio * 100.0
+                );
+                // Compatible with BOTH VS Code Copilot (`continue: false`, `stopReason`) and Claude Code (`decision: "block"`, `reason`)
                 json!({
+                    "continue": false,
+                    "stopReason": stop_msg,
+                    "systemMessage": stop_msg,
                     "decision": "block",
-                    "reason": format!(
-                        "Context saturation reached {:.1}% (>35% hard ceiling). Session handoff & compiled prompt have been saved to .router/HANDOFF.md and .router/session.json. Please run `/clear` (or start a new session) and re-run your prompt.",
-                        envelope.session_meta.saturation_ratio * 100.0
-                    ),
+                    "reason": stop_msg,
                     "hookSpecificOutput": {
                         "hookEventName": event_name,
                         "additionalContext": context
@@ -203,11 +205,24 @@ pub fn run_stdio_hook(default_repo_root: &Path) -> io::Result<()> {
                 })
             } else {
                 let event_name = req
-                    .get("hook_event_name")
-                    .or_else(|| req.get("hookEventName"))
+                    .get("hookEventName")
+                    .or_else(|| req.get("hook_event_name"))
                     .and_then(|e| e.as_str())
                     .unwrap_or("UserPromptSubmit");
+                let skills_label = if envelope.routing.required_skills.is_empty() {
+                    "none".to_string()
+                } else {
+                    envelope.routing.required_skills.join(",")
+                };
+                let status_banner = format!(
+                    "⚡ AgentRouter [{:.1}%/35% ctx | subagent: {} | skills: {}]",
+                    envelope.session_meta.saturation_ratio * 100.0,
+                    envelope.routing.target_subagent,
+                    skills_label
+                );
                 json!({
+                    "continue": true,
+                    "systemMessage": status_banner,
                     "hookSpecificOutput": {
                         "hookEventName": event_name,
                         "additionalContext": context
