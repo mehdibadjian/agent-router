@@ -1,11 +1,12 @@
-use crate::run_pipeline;
+use crate::budget::estimate_tokens;
+use crate::run_pipeline_with_context;
 use crate::types::RouterEnvelope;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-/// Format the [`RouterEnvelope`] into a concise context block injected by hooks.
+/// Format the [`RouterEnvelope`] into an imperative context block that forces subagent & skill usage.
 pub fn format_hook_context(envelope: &RouterEnvelope) -> String {
     let mut sections = Vec::new();
 
@@ -20,8 +21,29 @@ pub fn format_hook_context(envelope: &RouterEnvelope) -> String {
         envelope.routing.passthrough,
     ));
 
+    // Imperative routing directive so the host harness actually delegates to the subagent & skills
+    if envelope.routing.target_subagent != "default" || !envelope.routing.required_skills.is_empty() {
+        let mut directives = Vec::new();
+        if envelope.routing.target_subagent != "default" {
+            directives.push(format!(
+                "- MANDATORY SUBAGENT: Delegate execution to subagent `{}` (defined at `{}`).",
+                envelope.routing.target_subagent, envelope.routing.target_subagent_path
+            ));
+        }
+        if !envelope.routing.required_skills.is_empty() {
+            directives.push(format!(
+                "- MANDATORY SKILLS: Load and follow the skill instructions at: `{}`.",
+                envelope.routing.required_skills.join("`, `")
+            ));
+        }
+        sections.push(format!(
+            "<routing_directive>\n{}\n</routing_directive>",
+            directives.join("\n")
+        ));
+    }
+
     if let Some(handoff) = &envelope.payload.context_handoff_summary {
-        if envelope.session_meta.threshold_exceeded {
+        if !handoff.is_empty() {
             sections.push(format!("<session_handoff>\n{}\n</session_handoff>", handoff));
         }
     }
@@ -38,7 +60,10 @@ fn extract_prompt_from_transcript(transcript_path: &str) -> Option<String> {
         if trimmed.is_empty() {
             continue;
         }
-        let entry: Value = serde_json::from_str(trimmed).ok()?;
+        // Use `let Ok(...) else { continue }` so a single malformed line doesn't abort the scan
+        let Ok(entry) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
         let is_user_input = entry
             .get("type")
             .and_then(|t| t.as_str())
@@ -53,6 +78,26 @@ fn extract_prompt_from_transcript(transcript_path: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Estimate real session token usage directly from the harness transcript file if provided.
+fn estimate_transcript_tokens(req: &Value) -> Option<usize> {
+    let path_str = req
+        .get("transcript_path")
+        .or_else(|| req.get("transcriptPath"))
+        .and_then(|p| p.as_str())?;
+
+    let content = fs::read_to_string(path_str).ok()?;
+    Some(estimate_tokens(&content))
+}
+
+/// Extract the host harness's native session/conversation ID to detect `/clear` or new sessions.
+fn extract_host_session_id(req: &Value) -> Option<String> {
+    req.get("session_id")
+        .or_else(|| req.get("sessionId"))
+        .or_else(|| req.get("conversationId"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Detect whether the hook input came from Antigravity (`PreInvocation` / `SessionStart`)
@@ -96,10 +141,7 @@ pub fn run_stdio_hook(default_repo_root: &Path) -> io::Result<()> {
     let repo_root: PathBuf = req
         .get("cwd")
         .and_then(|c| c.as_str())
-        .or_else(|| {
-            req.pointer("/workspacePaths/0")
-                .and_then(|p| p.as_str())
-        })
+        .or_else(|| req.pointer("/workspacePaths/0").and_then(|p| p.as_str()))
         .map(PathBuf::from)
         .filter(|p| p.exists())
         .unwrap_or_else(|| default_repo_root.to_path_buf());
@@ -122,7 +164,15 @@ pub fn run_stdio_hook(default_repo_root: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    let response = match run_pipeline(&repo_root, &raw_prompt) {
+    let observed_tokens = estimate_transcript_tokens(&req);
+    let host_session_id = extract_host_session_id(&req);
+
+    let response = match run_pipeline_with_context(
+        &repo_root,
+        &raw_prompt,
+        observed_tokens,
+        host_session_id,
+    ) {
         Ok(envelope) => {
             let context = format_hook_context(&envelope);
             if is_agy_hook(&req) {
@@ -132,6 +182,24 @@ pub fn run_stdio_hook(default_repo_root: &Path) -> io::Result<()> {
                             "ephemeralMessage": context
                         }
                     ]
+                })
+            } else if envelope.session_meta.threshold_exceeded {
+                let event_name = req
+                    .get("hook_event_name")
+                    .or_else(|| req.get("hookEventName"))
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("UserPromptSubmit");
+                // Hard Circuit Breaker: Block the bloated session turn and surface the handoff
+                json!({
+                    "decision": "block",
+                    "reason": format!(
+                        "Context saturation reached {:.1}% (>35% hard ceiling). Session handoff & compiled prompt have been saved to .router/HANDOFF.md and .router/session.json. Please run `/clear` (or start a new session) and re-run your prompt.",
+                        envelope.session_meta.saturation_ratio * 100.0
+                    ),
+                    "hookSpecificOutput": {
+                        "hookEventName": event_name,
+                        "additionalContext": context
+                    }
                 })
             } else {
                 let event_name = req

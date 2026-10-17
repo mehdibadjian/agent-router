@@ -19,6 +19,8 @@ pub struct RegistryCache {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SessionState {
     pub session_id: u64,
+    #[serde(default)]
+    pub host_session_id: Option<String>,
     pub accumulated_tokens: usize,
     pub rolling_summary: String,
 }
@@ -27,6 +29,7 @@ impl Default for SessionState {
     fn default() -> Self {
         Self {
             session_id: 1,
+            host_session_id: None,
             accumulated_tokens: 0,
             rolling_summary: String::new(),
         }
