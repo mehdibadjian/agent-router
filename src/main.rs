@@ -36,12 +36,14 @@ pub fn run_pipeline_with_context(
     let handoff_file = router_dir.join("HANDOFF.md");
     let mut session = budget::load_session(&session_file);
 
-    // If the host harness started a brand new session (e.g. after `/clear`), reset token counter
-    // while keeping any rolling_summary handoff intact for the first turn!
+    // If the host harness started a brand new session (e.g. after `/clear` or clicking `+`),
+    // reset token counter while keeping any pending handoff intact for the first turn.
     if let Some(ref new_host_id) = host_session_id {
         if session.host_session_id.as_ref() != Some(new_host_id) {
+            if session.host_session_id.is_some() || handoff_file.exists() {
+                session.accumulated_tokens = 0;
+            }
             session.host_session_id = Some(new_host_id.clone());
-            session.accumulated_tokens = 0;
         }
     }
 

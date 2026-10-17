@@ -97,10 +97,14 @@ pub fn parse_manifest(
             .unwrap_or("unknown-skill")
             .to_string()
     } else {
-        file_path
+        let raw_stem = file_path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("unknown-agent")
+            .unwrap_or("unknown-agent");
+        raw_stem
+            .strip_suffix(".agent")
+            .or_else(|| raw_stem.strip_suffix(".instructions"))
+            .unwrap_or(raw_stem)
             .to_string()
     };
 
@@ -171,6 +175,26 @@ mod tests {
         assert_eq!(entry.id, "sec-auditor");
         assert_eq!(entry.description, "Audits Rust unsafe blocks");
         assert_eq!(entry.triggers, vec!["security", "unsafe", "audit"]);
+    }
+
+    #[test]
+    fn strips_agent_and_instructions_double_extension_when_name_omitted() {
+        let md = "---\ndescription: Custom VS Code agent without explicit name\ntriggers: [rust]\n---\n# Body";
+        let entry = parse_manifest(
+            Path::new("/repo"),
+            Path::new("/repo/.github/agents/rust-architect.agent.md"),
+            "agent",
+            md,
+        );
+        assert_eq!(entry.id, "rust-architect");
+
+        let instr = parse_manifest(
+            Path::new("/repo"),
+            Path::new("/repo/.github/instructions/coding-style.instructions.md"),
+            "skill",
+            md,
+        );
+        assert_eq!(instr.id, "coding-style");
     }
 
     #[test]
