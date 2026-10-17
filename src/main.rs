@@ -11,6 +11,15 @@ use std::path::Path;
 use types::RouterEnvelope;
 
 pub fn run_pipeline(repo_root: &Path, raw_prompt: &str) -> Result<RouterEnvelope, String> {
+    run_pipeline_with_context(repo_root, raw_prompt, None, None)
+}
+
+pub fn run_pipeline_with_context(
+    repo_root: &Path,
+    raw_prompt: &str,
+    observed_transcript_tokens: Option<usize>,
+    host_session_id: Option<String>,
+) -> Result<RouterEnvelope, String> {
     let router_dir = repo_root.join(".router");
     fs::create_dir_all(&router_dir).map_err(|e| e.to_string())?;
 
@@ -23,9 +32,27 @@ pub fn run_pipeline(repo_root: &Path, raw_prompt: &str) -> Result<RouterEnvelope
         .and_then(|v| v.parse().ok())
         .unwrap_or(128_000);
 
-    // Step 0: Evaluate Context Budget (35% Ceiling)
     let session_file = router_dir.join("session.json");
+    let handoff_file = router_dir.join("HANDOFF.md");
     let mut session = budget::load_session(&session_file);
+
+    // If the host harness started a brand new session (e.g. after `/clear`), reset token counter
+    // while keeping any rolling_summary handoff intact for the first turn!
+    if let Some(ref new_host_id) = host_session_id {
+        if session.host_session_id.as_ref() != Some(new_host_id) {
+            session.host_session_id = Some(new_host_id.clone());
+            session.accumulated_tokens = 0;
+        }
+    }
+
+    // If the hook provided a live transcript path, sync accumulated_tokens with real transcript size
+    if let Some(real_tokens) = observed_transcript_tokens {
+        if real_tokens > session.accumulated_tokens {
+            session.accumulated_tokens = real_tokens;
+        }
+    }
+
+    // Step 0: Evaluate Context Budget (35% Ceiling)
     let eval = budget::evaluate_budget(&session, raw_prompt, base_overhead, max_window);
 
     // Step 2: Load or Build XXH3 Mtime-Cached Capability Registry
@@ -33,7 +60,23 @@ pub fn run_pipeline(repo_root: &Path, raw_prompt: &str) -> Result<RouterEnvelope
     let registry = registry::load_or_build_registry(repo_root, &cache_file);
 
     // Step 1: Compile Prompt & Select Subagent/Skills (Fail-Open Resilient)
-    let decision = compiler::compile_and_route(raw_prompt, &registry, &session, eval.must_reset_session);
+    let mut decision =
+        compiler::compile_and_route(raw_prompt, &registry, &session, eval.must_reset_session);
+
+    // Persist or consume `.router/HANDOFF.md` across blocked -> fresh session transitions
+    if eval.must_reset_session {
+        if let Some(ref handoff) = decision.context_handoff_summary {
+            let _ = fs::write(&handoff_file, handoff);
+        }
+    } else if handoff_file.exists() {
+        if let Ok(pending_handoff) = fs::read_to_string(&handoff_file) {
+            let trimmed = pending_handoff.trim();
+            if !trimmed.is_empty() && decision.context_handoff_summary.is_none() {
+                decision.context_handoff_summary = Some(trimmed.to_string());
+            }
+        }
+        let _ = fs::remove_file(&handoff_file);
+    }
 
     // Commit Updated Token Ledger
     budget::commit_turn_to_ledger(

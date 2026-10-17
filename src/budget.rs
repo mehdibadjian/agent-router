@@ -80,6 +80,7 @@ mod tests {
     fn triggers_reset_strictly_above_35_percent() {
         let state = SessionState {
             session_id: 1,
+            host_session_id: None,
             accumulated_tokens: 35_000,
             rolling_summary: String::new(),
         };
@@ -93,6 +94,7 @@ mod tests {
     fn stays_in_session_at_or_below_35_percent() {
         let state = SessionState {
             session_id: 1,
+            host_session_id: None,
             accumulated_tokens: 20_000,
             rolling_summary: String::new(),
         };
