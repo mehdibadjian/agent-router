@@ -390,6 +390,7 @@ jobs:
           ls -la assets/
           cp assets/agent-router-static-binaries.tar.gz "assets/agent-router-${TAG}-static-binaries.tar.gz"
           gh release upload "$TAG" \
+            --repo "${{ github.repository }}" \
             assets/agent-router-x86_64-unknown-linux-musl \
             assets/agent-router-aarch64-unknown-linux-musl \
             assets/agent-router-x86_64-pc-windows-msvc.exe \
