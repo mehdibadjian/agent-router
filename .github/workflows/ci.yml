@@ -278,7 +278,6 @@ jobs:
                    release-assets/agent-router-aarch64-unknown-linux-musl \
                    release-assets/agent-router-macos-universal
           tar -czf release-assets/agent-router-static-binaries.tar.gz -C dist .
-          cp release-assets/agent-router-static-binaries.tar.gz agent-router-0.1.0-static-binaries.tar.gz
           ls -la release-assets/
 
       - uses: actions/upload-artifact@v4

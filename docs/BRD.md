@@ -1,17 +1,17 @@
 # Business Requirements Document (BRD)
 
 **Project Name:** AgentRouter (Zero-Dependency System 1 Pre-Processor & Subagent Dispatcher)
-**Document Version:** 1.0
-**Date:** October 16, 2026
+**Document Version:** 1.1 (`v0.3.0`)
+**Date:** October 18, 2026
 **Target Architecture:** Standalone Native Static Binary (Rust / Zero Runtime Dependencies)
 
 ## 1. Executive Summary & Business Case
 
-Modern AI coding and orchestration harnesses (such as Claude Code, Cursor, LangGraph, CrewAI, and custom CLI runners) suffer from three compounding operational bottlenecks:
+Modern AI coding and orchestration harnesses (such as Claude Code, VS Code GitHub Copilot, Cursor, Antigravity, LangGraph, CrewAI, and custom CLI runners) suffer from three compounding operational bottlenecks:
 
 * **Context Window Degradation ("Lost-in-the-Middle"):** As session history grows beyond 35% saturation, frontier "System 2" models experience degraded reasoning accuracy while incurring exponential KV-cache and input token costs.
 * **Unstructured User Prompts:** Terse, ambiguous developer prompts force expensive frontier models to spend multiple reasoning turns clarifying intent, grepping files, and guessing verification criteria.
-* **Harness Lock-In & Fragmented Discovery:** Repositories increasingly contain specialized subagents and modular skills (`SKILL.md`, `.agents/*.md`), but discovering, caching, and routing to them is tightly coupled to specific vendor harnesses or requires heavy runtime dependencies (Python/Node.js).
+* **Harness Lock-In & Fragmented Discovery:** Repositories increasingly contain specialized subagents, skills, prompts, and instructions (`SKILL.md`, `.agents/*.md`, `.github/agents/*.agent.md`, `.github/prompts/*.prompt.md`, `.github/instructions/*.instructions.md`), but discovering, caching, and routing to them is tightly coupled to specific vendor harnesses or requires heavy runtime dependencies (Python/Node.js).
 
 AgentRouter solves this by introducing a harness-agnostic, zero-dependency native binary that intercepts raw user prompts before they hit expensive execution models. Using a free (local Ollama/MLX) or ultra-low-cost model (Gemini Flash-Lite, DeepSeek, Haiku), it enforces a hard 35% context ceiling, compiles raw prompts into deterministic engineering specifications, caches repository capabilities in sub-milliseconds, and dispatches the payload to the optimal subagent.
 
@@ -30,16 +30,16 @@ AgentRouter solves this by introducing a harness-agnostic, zero-dependency nativ
 ### 3.1 In-Scope
 
 * **Zero-Dependency Cross-Platform Binary:** Native compilation for Linux (x86_64 / aarch64 static musl), macOS (Universal Apple Silicon + Intel), and Windows (x86_64 static MSVC CRT).
-* **Step 0 (Context Circuit Breaker):** Token ledger tracking, configurable harness overhead accounting, 35% saturation enforcement, and automated state-handoff rollups on session reset.
+* **Step 0 (Context Circuit Breaker):** Token ledger tracking, live `transcript_path` token measurement, configurable harness overhead accounting, 35% saturation enforcement, multi-turn `rolling_summary` breadcrumb tracking, and `.router/HANDOFF.md` state-handoff persistence across blocked -> fresh session resets.
 * **Step 1 (Prompt Compiler):** Integration with any OpenAI-compatible local or cloud endpoint to transform raw user prompts into structured specifications (Objective, Constraints, Context, Verification), plus a passthrough gate for trivial commands.
-* **Step 2 (Capability Registry & Cache):** High-speed filesystem scanner and frontmatter parser for repo-local agents and skills, backed by xxh3 modification-time (mtime) hashing.
+* **Step 2 (Capability Registry & Cache):** High-speed filesystem scanner and frontmatter parser for repo-local agents, skills, prompts, and instructions, backed by xxh3 modification-time (mtime) hashing.
 * **Step 3 (Harness-Agnostic Dispatcher):** Multi-mode execution supporting CLI subprocess wrapping, raw stdout JSON, and a native stdin/stdout lifecycle hook adapter (`--hook`) for VS Code Copilot, Claude Code, and Antigravity (AGY).
 
 ### 3.2 Out-of-Scope
 
 * Building a full "System 2" autonomous coding loop (AgentRouter delegates execution to existing harnesses/subagents).
 * GUI or web dashboard interfaces (strictly CLI, environment variables, and stdio hook JSON).
-* External database dependencies (all state is persisted locally in `.router/*.json`).
+* External database dependencies (all state is persisted locally in `.router/*.json` and `.router/HANDOFF.md`).
 
 ## 4. Functional Requirements
 
@@ -47,10 +47,10 @@ AgentRouter solves this by introducing a harness-agnostic, zero-dependency nativ
 
 | Req ID | Requirement Description | Priority | Acceptance Criteria |
 |---|---|---|---|
-| FR-0.1 | Zero-Dependency Token Estimation: Estimate token counts for system overhead, session history, injected skills, and the incoming prompt without external C/C++ tokenizers. | P0 | Token count calculation completes in less than 1ms with less than 3% variance against standard BPE (cl100k_base / o200k_base). |
+| FR-0.1 | Zero-Dependency Token Estimation & Live Transcript Sizing: Estimate token counts for system overhead, session history (including live `transcript_path` files passed by VS Code / Claude / AGY), injected skills, and the incoming prompt without external C/C++ tokenizers. | P0 | Token count calculation completes in less than 1ms with less than 3% variance against standard BPE (cl100k_base / o200k_base). |
 | FR-0.2 | Configurable Harness Overhead: Account for hidden tokens injected by the underlying harness (system prompts, tool definitions, rules files). | P0 | Supports `ROUTER_BASE_OVERHEAD_TOKENS` (default: 10000) and `ROUTER_MAX_TOKENS` (default: 128000). |
-| FR-0.3 | 35% Hard Saturation Trigger: Evaluate total projected tokens against `ROUTER_MAX_TOKENS`. If usage exceeds 0.35 (35%), flag the session for mandatory reset. | P0 | Any request pushing cumulative session tokens above 35.0% sets `must_reset_session = true` deterministically. |
-| FR-0.4 | Session Handoff Compression: When a reset is triggered, instruct the low-cost model to compress prior session state into a dense `<session_handoff>` artifact before clearing the ledger. | P0 | New session starts with a clean ledger (`session_id + 1`), resetting accumulated tokens while preserving active file paths, architectural decisions, and pending blockers in under 500 tokens. |
+| FR-0.3 | 35% Hard Saturation Trigger & Hook Block Pinning: Evaluate total projected tokens against `ROUTER_MAX_TOKENS`. If usage exceeds 0.35 (35%), flag the session for mandatory reset and block execution in `--hook` mode (`continue: false, decision: "block"`), keeping `accumulated_tokens` pinned until the host `sessionId` changes on New Chat (`+`) or `/clear`. | P0 | Any request pushing cumulative session tokens above 35.0% sets `must_reset_session = true` deterministically and continues blocking same-session retries until a fresh session starts. |
+| FR-0.4 | Rolling Summary Breadcrumbs & `.router/HANDOFF.md` Persistence: Append turn-by-turn objective breadcrumbs into `rolling_summary` during normal turns; when a reset is triggered, persist the compressed handoff to `.router/HANDOFF.md` and inject `<session_handoff>` on the first non-passthrough turn of the new session. | P0 | New session starts with a clean ledger (`accumulated_tokens = 0`), preserving prior turn breadcrumbs across trivial passthrough commands (`git status`) and deleting `.router/HANDOFF.md` once consumed. |
 
 ### 4.2 Module 1: Low-Cost Prompt Compiler
 
@@ -65,7 +65,7 @@ AgentRouter solves this by introducing a harness-agnostic, zero-dependency nativ
 
 | Req ID | Requirement Description | Priority | Acceptance Criteria |
 |---|---|---|---|
-| FR-2.1 | Multi-Convention Directory Discovery: Scan standard repository paths (`.agents/`, `.claude/agents/`, `.github/agents/`, `skills/`, `.claude/skills/`, `.github/skills/`). | P0 | Discovers all `.md` agent/skill manifests across nested directories. |
+| FR-2.1 | Multi-Convention Directory Discovery: Scan standard repository paths (`.agents/`, `.claude/agents/`, `.github/agents/`, `skills/`, `.claude/skills/`, `.github/skills/`, `.github/prompts/`, `.github/instructions/`). | P0 | Discovers all `.md` agent, skill, prompt, and instruction manifests across nested directories and strips `.agent.md`, `.prompt.md`, and `.instructions.md` double extensions. |
 | FR-2.2 | Frontmatter & Header Extraction: Parse only the YAML frontmatter (name, description, triggers) or top lines of each manifest so full skill bodies do not bloat the router's prompt. | P0 | Registry index stays under 1,000 tokens even in repositories with 50+ skills and subagents. |
 | FR-2.3 | Content-Addressable Mtime Caching: Compute a 64-bit XXH3 hash of all discovered file paths and nanosecond modification timestamps (mtime). | P0 | If no agent/skill files have changed since the last invocation, `.router/registry.json` is loaded from disk in less than 2ms with zero file re-parsing. |
 
@@ -73,10 +73,10 @@ AgentRouter solves this by introducing a harness-agnostic, zero-dependency nativ
 
 | Req ID | Requirement Description | Priority | Acceptance Criteria |
 |---|---|---|---|
-| FR-3.1 | Subagent & Skill Matching: Select the single most qualified `target_subagent` and an array of `required_skills` based on the compiled prompt and cached registry. | P0 | Router outputs valid paths/IDs matching the cached registry; falls back to `default` if no specialized agent matches. |
+| FR-3.1 | Subagent & Skill Matching: Select the single most qualified `target_subagent` and an array of `required_skills` based on the compiled prompt and cached registry. | P0 | Router outputs valid paths/IDs matching the cached registry; falls back to `default` if no specialized agent matches or in skills-only repositories. |
 | FR-3.2 | Adapter Mode A — CLI Wrapper / Subprocess Spawner: Spawn any target CLI harness (claude, agy, aider, codex, opencode, custom scripts) passing the compiled prompt, target subagent, and session reset flags. | P0 | Properly forwards stdin/stdout/stderr, injects environment variables (`ROUTED_SUBAGENT`, `ROUTED_SKILLS`, `ROUTED_SESSION_ACTION`), and propagates exit codes. |
 | FR-3.3 | Adapter Mode B — Stdout JSON Contract: Emit a deterministic JSON payload to stdout when invoked with a prompt argument and no harness binary, enabling custom scripts. | P0 | Outputs clean, parseable JSON to stdout while routing all diagnostic logs strictly to stderr. |
-| FR-3.4 | Adapter Mode C — Native Lifecycle Hook Adapter: Run via `agent-router --hook`, reading hook stdin JSON and outputting harness-native context injection (`hookSpecificOutput.additionalContext` for VS Code Copilot & Claude Code; `injectSteps` for Antigravity). | P0 | Zero-config drop-in hook for `.github/hooks/*.json`, `.claude/settings.json`, and `.agents/hooks.json`; fails open with `{}` on malformed input. |
+| FR-3.4 | Adapter Mode C — Native Lifecycle Hook Adapter: Run via `agent-router --hook`, reading hook stdin JSON and outputting harness-native context injection (`hookSpecificOutput.additionalContext` with `<routing_directive>` + `systemMessage` status banner for VS Code Copilot & Claude Code; `injectSteps` for Antigravity). | P0 | Zero-config drop-in hook for `.github/hooks/*.json`, `.claude/settings.json`, and `.agents/hooks.json`; enforces 35% hard blocks (`continue: false, decision: "block"`) and fails open with `{}` on malformed input. |
 
 ## 5. Non-Functional Requirements (NFRs)
 

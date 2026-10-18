@@ -1,8 +1,8 @@
 # Zero-Hallucination Implementation Plan
 
 **Project:** AgentRouter (Zero-Dependency System 1 Pre-Processor & Subagent Dispatcher)
-**Document Version:** 1.0
-**Date:** October 16, 2026
+**Document Version:** 1.1 (`v0.3.0`)
+**Date:** October 18, 2026
 **Companion Document:** [BRD.md](./BRD.md)
 
 This Zero-Hallucination Implementation Plan is structured as an execution-ready blueprint you can hand directly to a coding agent (or follow file-by-file). It locks down exact crate versions, prohibits unrequested dependencies (no tokio, no openssl, no clap, no serde_yaml), defines every struct and function signature, and includes deterministic unit tests for every module.
@@ -23,11 +23,16 @@ Any coding agent executing this specification MUST obey these five hard rules:
 agent-router/
 ├── .cargo/
 │   └── config.toml        # Static linking flags for Linux musl & Windows MSVC
+├── .github/
+│   └── hooks/
+│       └── agent-router.json # VS Code Copilot UserPromptSubmit hook config
+├── .vscode/
+│   └── settings.json      # Enables chat.useHooks and customAgentInSubagent
 ├── Cargo.toml             # Locked dependencies & size-optimized release profile
 └── src/
     ├── main.rs            # CLI parser (std::env::args) & orchestration pipeline
     ├── types.rs           # Shared data contracts & serde structs
-    ├── budget.rs          # Step 0: Token estimator & 35% circuit breaker
+    ├── budget.rs          # Step 0: Token estimator, rolling breadcrumbs & 35% circuit breaker
     ├── registry.rs        # Step 2: XXH3 mtime scanner & frontmatter parser
     ├── compiler.rs        # Step 1: Low-cost LLM client, prompt compiler & fail-open fallback
     ├── dispatcher.rs      # Step 3: CLI subprocess spawner & stdout JSON emitter
@@ -54,7 +59,7 @@ rustflags = ["-C", "target-feature=+crt-static"]
 ```toml
 [package]
 name = "agent-router"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -100,6 +105,8 @@ pub struct RegistryCache {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SessionState {
     pub session_id: u64,
+    #[serde(default)]
+    pub host_session_id: Option<String>,
     pub accumulated_tokens: usize,
     pub rolling_summary: String,
 }
@@ -108,6 +115,7 @@ impl Default for SessionState {
     fn default() -> Self {
         Self {
             session_id: 1,
+            host_session_id: None,
             accumulated_tokens: 0,
             rolling_summary: String::new(),
         }
@@ -157,7 +165,7 @@ pub struct PromptPayload {
 
 ### File 4: `src/budget.rs` (Step 0: Token Estimator & 35% Circuit Breaker)
 
-Implements zero-dependency BPE token estimation, ledger persistence, and the 35% hard ceiling.
+Implements zero-dependency BPE token estimation, ledger persistence, turn-by-turn `rolling_summary` breadcrumb accumulation, and the 35% hard ceiling.
 
 ```rust
 use crate::types::SessionState;
@@ -219,6 +227,7 @@ pub fn evaluate_budget(
 pub fn commit_turn_to_ledger(
     session: &mut SessionState,
     eval: &BudgetEvaluation,
+    raw_prompt: &str,
     compiled_prompt: &str,
     handoff_summary: Option<String>,
 ) {
@@ -231,6 +240,30 @@ pub fn commit_turn_to_ledger(
         session.rolling_summary = handoff;
     } else {
         session.accumulated_tokens += compiled_tokens;
+        let snippet: String = raw_prompt
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect();
+        if !snippet.is_empty() {
+            if !session.rolling_summary.is_empty() {
+                session.rolling_summary.push_str(" -> ");
+            }
+            session.rolling_summary.push_str(&snippet);
+            // Cap rolling_summary to last ~600 chars (UTF-8 safe)
+            if session.rolling_summary.len() > 600 {
+                let mut start = session.rolling_summary.len() - 600;
+                while start < session.rolling_summary.len()
+                    && !session.rolling_summary.is_char_boundary(start)
+                {
+                    start += 1;
+                }
+                session.rolling_summary = session.rolling_summary[start..].to_string();
+            }
+        }
     }
 }
 
@@ -242,6 +275,7 @@ mod tests {
     fn triggers_reset_strictly_above_35_percent() {
         let state = SessionState {
             session_id: 1,
+            host_session_id: None,
             accumulated_tokens: 35_000,
             rolling_summary: String::new(),
         };
@@ -255,6 +289,7 @@ mod tests {
     fn stays_in_session_at_or_below_35_percent() {
         let state = SessionState {
             session_id: 1,
+            host_session_id: None,
             accumulated_tokens: 20_000,
             rolling_summary: String::new(),
         };
@@ -267,7 +302,7 @@ mod tests {
 
 ### File 5: `src/registry.rs` (Step 2: Mtime-Cached Skill & Agent Scanner)
 
-Includes a zero-dependency YAML frontmatter extractor so the router reads `name`, `description`, and `triggers` without pulling in `serde_yaml`.
+Includes a zero-dependency YAML frontmatter extractor so the router reads `name`, `description`, and `triggers` without pulling in `serde_yaml`, and indexes `.github/agents`, `.github/skills`, `.github/prompts`, and `.github/instructions`.
 
 ```rust
 use crate::types::{AgentEntry, RegistryCache};
@@ -285,6 +320,8 @@ const SEARCH_DIRS: &[(&str, &str)] = &[
     ("skills", "skill"),
     (".claude/skills", "skill"),
     (".github/skills", "skill"),
+    (".github/prompts", "skill"),
+    (".github/instructions", "skill"),
 ];
 
 pub fn load_or_build_registry(
@@ -369,10 +406,15 @@ pub fn parse_manifest(
             .unwrap_or("unknown-skill")
             .to_string()
     } else {
-        file_path
+        let raw_stem = file_path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("unknown-agent")
+            .unwrap_or("unknown-agent");
+        raw_stem
+            .strip_suffix(".agent")
+            .or_else(|| raw_stem.strip_suffix(".instructions"))
+            .or_else(|| raw_stem.strip_suffix(".prompt"))
+            .unwrap_or(raw_stem)
             .to_string()
     };
 
@@ -443,6 +485,34 @@ mod tests {
         assert_eq!(entry.id, "sec-auditor");
         assert_eq!(entry.description, "Audits Rust unsafe blocks");
         assert_eq!(entry.triggers, vec!["security", "unsafe", "audit"]);
+    }
+
+    #[test]
+    fn strips_agent_and_instructions_double_extension_when_name_omitted() {
+        let md = "---\ndescription: Custom VS Code agent without explicit name\ntriggers: [rust]\n---\n# Body";
+        let entry = parse_manifest(
+            Path::new("/repo"),
+            Path::new("/repo/.github/agents/rust-architect.agent.md"),
+            "agent",
+            md,
+        );
+        assert_eq!(entry.id, "rust-architect");
+
+        let instr = parse_manifest(
+            Path::new("/repo"),
+            Path::new("/repo/.github/instructions/coding-style.instructions.md"),
+            "skill",
+            md,
+        );
+        assert_eq!(instr.id, "coding-style");
+
+        let prompt = parse_manifest(
+            Path::new("/repo"),
+            Path::new("/repo/.github/prompts/refactor.prompt.md"),
+            "skill",
+            md,
+        );
+        assert_eq!(prompt.id, "refactor");
     }
 
     #[test]
@@ -768,14 +838,15 @@ pub fn execute_dispatch(envelope: &RouterEnvelope) -> Result<i32, String> {
 Implements synchronous stdin/stdout lifecycle hook handling (`agent-router --hook`) for VS Code GitHub Copilot, Claude Code, and Antigravity (AGY).
 
 ```rust
-use crate::run_pipeline;
+use crate::budget::estimate_tokens;
+use crate::run_pipeline_with_context;
 use crate::types::RouterEnvelope;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-/// Format the [`RouterEnvelope`] into a concise context block injected by hooks.
+/// Format the [`RouterEnvelope`] into an imperative context block optimized for VS Code Copilot (`runSubagent`) and Claude Code.
 pub fn format_hook_context(envelope: &RouterEnvelope) -> String {
     let mut sections = Vec::new();
 
@@ -790,8 +861,30 @@ pub fn format_hook_context(envelope: &RouterEnvelope) -> String {
         envelope.routing.passthrough,
     ));
 
+    // Imperative routing directive tailored for VS Code Copilot `runSubagent` + Claude Code `Task`
+    if envelope.routing.target_subagent != "default" || !envelope.routing.required_skills.is_empty() {
+        let mut directives = Vec::new();
+        if envelope.routing.target_subagent != "default" {
+            directives.push(format!(
+                "- MANDATORY SUBAGENT DELEGATION: You MUST delegate this task to the custom agent `{name}` (defined at `{path}`). In VS Code Copilot, invoke the `runSubagent` (`agent/runSubagent`) tool with `agentName: \"{name}\"` and pass the `<objective>`, `<constraints>`, and `<verification>` blocks below as its `prompt`. If `runSubagent` is unavailable, read `{path}` first and strictly adopt its persona and constraints.",
+                name = envelope.routing.target_subagent,
+                path = envelope.routing.target_subagent_path
+            ));
+        }
+        if !envelope.routing.required_skills.is_empty() {
+            directives.push(format!(
+                "- MANDATORY SKILLS: Before writing code, read and follow the skill instructions at: `{}`.",
+                envelope.routing.required_skills.join("`, `")
+            ));
+        }
+        sections.push(format!(
+            "<routing_directive>\n{}\n</routing_directive>",
+            directives.join("\n")
+        ));
+    }
+
     if let Some(handoff) = &envelope.payload.context_handoff_summary {
-        if envelope.session_meta.threshold_exceeded {
+        if !handoff.is_empty() {
             sections.push(format!("<session_handoff>\n{}\n</session_handoff>", handoff));
         }
     }
@@ -808,7 +901,9 @@ fn extract_prompt_from_transcript(transcript_path: &str) -> Option<String> {
         if trimmed.is_empty() {
             continue;
         }
-        let entry: Value = serde_json::from_str(trimmed).ok()?;
+        let Ok(entry) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
         let is_user_input = entry
             .get("type")
             .and_then(|t| t.as_str())
@@ -823,6 +918,26 @@ fn extract_prompt_from_transcript(transcript_path: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Estimate real session token usage directly from the harness transcript file (`transcript_path` in VS Code / Claude).
+fn estimate_transcript_tokens(req: &Value) -> Option<usize> {
+    let path_str = req
+        .get("transcript_path")
+        .or_else(|| req.get("transcriptPath"))
+        .and_then(|p| p.as_str())?;
+
+    let content = fs::read_to_string(path_str).ok()?;
+    Some(estimate_tokens(&content))
+}
+
+/// Extract the host harness's native session ID (`sessionId` in VS Code, `session_id` in Claude/Copilot CLI).
+fn extract_host_session_id(req: &Value) -> Option<String> {
+    req.get("sessionId")
+        .or_else(|| req.get("session_id"))
+        .or_else(|| req.get("conversationId"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
 }
 
 fn is_agy_hook(input: &Value) -> bool {
@@ -878,24 +993,76 @@ pub fn run_stdio_hook(default_repo_root: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    let response = match run_pipeline(&repo_root, &raw_prompt) {
+    let observed_tokens = estimate_transcript_tokens(&req);
+    let host_session_id = extract_host_session_id(&req);
+
+    let response = match run_pipeline_with_context(
+        &repo_root,
+        &raw_prompt,
+        observed_tokens,
+        host_session_id,
+    ) {
         Ok(envelope) => {
             let context = format_hook_context(&envelope);
             if is_agy_hook(&req) {
+                let agy_msg = if envelope.session_meta.threshold_exceeded {
+                    format!(
+                        "<circuit_breaker_alert>\nSTOP: Context saturation reached {:.1}% (>35% hard ceiling). State handoff saved to `.router/HANDOFF.md`. Start a new conversation.\n</circuit_breaker_alert>\n\n{}",
+                        envelope.session_meta.saturation_ratio * 100.0,
+                        context
+                    )
+                } else {
+                    context
+                };
                 json!({
                     "injectSteps": [
                         {
-                            "ephemeralMessage": context
+                            "ephemeralMessage": agy_msg
                         }
                     ]
                 })
-            } else {
+            } else if envelope.session_meta.threshold_exceeded {
                 let event_name = req
-                    .get("hook_event_name")
-                    .or_else(|| req.get("hookEventName"))
+                    .get("hookEventName")
+                    .or_else(|| req.get("hook_event_name"))
                     .and_then(|e| e.as_str())
                     .unwrap_or("UserPromptSubmit");
+                let stop_msg = format!(
+                    "⚡ AgentRouter Circuit Breaker: Context reached {:.1}% (>35% ceiling). State handoff & compiled prompt saved to .router/HANDOFF.md. Click '+' (New Chat) or run `/clear` and re-submit your prompt.",
+                    envelope.session_meta.saturation_ratio * 100.0
+                );
+                // Compatible with BOTH VS Code Copilot (`continue: false`, `stopReason`) and Claude Code (`decision: "block"`, `reason`)
                 json!({
+                    "continue": false,
+                    "stopReason": stop_msg,
+                    "systemMessage": stop_msg,
+                    "decision": "block",
+                    "reason": stop_msg,
+                    "hookSpecificOutput": {
+                        "hookEventName": event_name,
+                        "additionalContext": context
+                    }
+                })
+            } else {
+                let event_name = req
+                    .get("hookEventName")
+                    .or_else(|| req.get("hook_event_name"))
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("UserPromptSubmit");
+                let skills_label = if envelope.routing.required_skills.is_empty() {
+                    "none".to_string()
+                } else {
+                    envelope.routing.required_skills.join(",")
+                };
+                let status_banner = format!(
+                    "⚡ AgentRouter [{:.1}%/35% ctx | subagent: {} | skills: {}]",
+                    envelope.session_meta.saturation_ratio * 100.0,
+                    envelope.routing.target_subagent,
+                    skills_label
+                );
+                json!({
+                    "continue": true,
+                    "systemMessage": status_banner,
                     "hookSpecificOutput": {
                         "hookEventName": event_name,
                         "additionalContext": context
@@ -931,6 +1098,15 @@ use std::path::Path;
 use types::RouterEnvelope;
 
 pub fn run_pipeline(repo_root: &Path, raw_prompt: &str) -> Result<RouterEnvelope, String> {
+    run_pipeline_with_context(repo_root, raw_prompt, None, None)
+}
+
+pub fn run_pipeline_with_context(
+    repo_root: &Path,
+    raw_prompt: &str,
+    observed_transcript_tokens: Option<usize>,
+    host_session_id: Option<String>,
+) -> Result<RouterEnvelope, String> {
     let router_dir = repo_root.join(".router");
     fs::create_dir_all(&router_dir).map_err(|e| e.to_string())?;
 
@@ -943,9 +1119,29 @@ pub fn run_pipeline(repo_root: &Path, raw_prompt: &str) -> Result<RouterEnvelope
         .and_then(|v| v.parse().ok())
         .unwrap_or(128_000);
 
-    // Step 0: Evaluate Context Budget (35% Ceiling)
     let session_file = router_dir.join("session.json");
+    let handoff_file = router_dir.join("HANDOFF.md");
     let mut session = budget::load_session(&session_file);
+
+    // If the host harness started a brand new session (e.g. after `/clear` or clicking `+`),
+    // reset token counter while keeping any pending handoff intact for the first turn.
+    if let Some(ref new_host_id) = host_session_id {
+        if session.host_session_id.as_ref() != Some(new_host_id) {
+            if session.host_session_id.is_some() || handoff_file.exists() {
+                session.accumulated_tokens = 0;
+            }
+            session.host_session_id = Some(new_host_id.clone());
+        }
+    }
+
+    // If the hook provided a live transcript path, sync accumulated_tokens with real transcript size
+    if let Some(real_tokens) = observed_transcript_tokens {
+        if real_tokens > session.accumulated_tokens {
+            session.accumulated_tokens = real_tokens;
+        }
+    }
+
+    // Step 0: Evaluate Context Budget (35% Ceiling)
     let eval = budget::evaluate_budget(&session, raw_prompt, base_overhead, max_window);
 
     // Step 2: Load or Build XXH3 Mtime-Cached Capability Registry
@@ -953,15 +1149,40 @@ pub fn run_pipeline(repo_root: &Path, raw_prompt: &str) -> Result<RouterEnvelope
     let registry = registry::load_or_build_registry(repo_root, &cache_file);
 
     // Step 1: Compile Prompt & Select Subagent/Skills (Fail-Open Resilient)
-    let decision = compiler::compile_and_route(raw_prompt, &registry, &session, eval.must_reset_session);
+    let mut decision =
+        compiler::compile_and_route(raw_prompt, &registry, &session, eval.must_reset_session);
+
+    // Persist or consume `.router/HANDOFF.md` across blocked -> fresh session transitions
+    if eval.must_reset_session {
+        if !handoff_file.exists() {
+            if let Some(ref handoff) = decision.context_handoff_summary {
+                let _ = fs::write(&handoff_file, handoff);
+            }
+        }
+    } else if handoff_file.exists() && !decision.passthrough {
+        if let Ok(pending_handoff) = fs::read_to_string(&handoff_file) {
+            let trimmed = pending_handoff.trim();
+            if !trimmed.is_empty() && decision.context_handoff_summary.is_none() {
+                decision.context_handoff_summary = Some(trimmed.to_string());
+            }
+        }
+        let _ = fs::remove_file(&handoff_file);
+    }
 
     // Commit Updated Token Ledger
+    let prior_tokens = session.accumulated_tokens;
     budget::commit_turn_to_ledger(
         &mut session,
         &eval,
+        raw_prompt,
         &decision.compiled_prompt,
         decision.context_handoff_summary.clone(),
     );
+    // If we are in Hook mode (`host_session_id.is_some()`) and blocked the turn (`must_reset_session`),
+    // keep `accumulated_tokens` pinned until `host_session_id` actually changes on New Chat (`+`)!
+    if eval.must_reset_session && host_session_id.is_some() {
+        session.accumulated_tokens = prior_tokens;
+    }
     budget::save_session(&session_file, &session).map_err(|e| e.to_string())?;
 
     eprintln!(
@@ -992,6 +1213,8 @@ fn main() {
         "--sync-tokens" => {
             match args.get(1).and_then(|s| s.parse::<usize>().ok()) {
                 Some(val) => {
+                    // The ledger may not exist yet (first calibration before any routed
+                    // turn), so ensure the state directory is present before writing.
                     let router_dir = repo_root.join(".router");
                     if let Err(e) = fs::create_dir_all(&router_dir) {
                         eprintln!("[agent-router] cannot create {}: {}", router_dir.display(), e);

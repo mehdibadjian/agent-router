@@ -16,11 +16,11 @@ raw prompt → Step 0 budget check → Step 2 registry cache → Step 1 compile+
 
 | Step | Module | Role |
 |---|---|---|
-| 0 | `src/budget.rs` | Estimates tokens with no BPE library; sets `must_reset_session` when projected usage exceeds 35% of the window; maintains the session ledger and handoff summary. |
-| 2 | `src/registry.rs` | Walks agent/skill directories, parses YAML frontmatter with a hand-rolled reader, and caches `.router/registry.json` behind an XXH3 fingerprint of paths + nanosecond mtimes. |
+| 0 | `src/budget.rs` | Estimates tokens with no BPE library; syncs with live harness `transcript_path` token counts; sets `must_reset_session` when projected usage exceeds 35% of the window; maintains turn-by-turn `rolling_summary` breadcrumbs and `.router/HANDOFF.md` state handoffs. |
+| 2 | `src/registry.rs` | Walks agent, skill, prompt, and instruction directories, parses YAML frontmatter with a hand-rolled reader (stripping `.agent.md`, `.prompt.md`, and `.instructions.md` double extensions), and caches `.router/registry.json` behind an XXH3 fingerprint of paths + nanosecond mtimes. |
 | 1 | `src/compiler.rs` | Calls any OpenAI-compatible endpoint to rewrite the prompt into `<objective>` / `<constraints>` / `<verification>`. Bypasses the call for trivial commands. Rejects invented agent IDs. Falls open on any failure. |
 | 3 | `src/dispatcher.rs` | Emits the envelope via CLI subprocess (`Mode A`) or clean stdout JSON (`Mode B`). |
-| 3C | `src/hook.rs` | Native lifecycle hook adapter (`--hook`) reading stdin JSON and emitting harness-native context injection for VS Code Copilot, Claude Code, and Antigravity (AGY). |
+| 3C | `src/hook.rs` | Native lifecycle hook adapter (`--hook`) reading stdin JSON and emitting harness-native context injection (`<routing_directive>` with `runSubagent` delegation + live `systemMessage` status banner, or hard 35% circuit-breaker block) for VS Code Copilot, Claude Code, and Antigravity (AGY). |
 
 ## Build
 
@@ -75,19 +75,28 @@ ROUTER_HARNESS_BIN=claude agent-router "add pagination to /users"
 
 Instead of running a stateful MCP server, `agent-router --hook` integrates directly with native lifecycle hooks in **VS Code GitHub Copilot**, **Claude Code**, and **Antigravity (AGY)**:
 
-### 1. VS Code GitHub Copilot (`.github/hooks/router.json`)
+### 1. VS Code GitHub Copilot (`.github/hooks/agent-router.json` & `.vscode/settings.json`)
 
+`.github/hooks/agent-router.json`:
 ```json
 {
   "hooks": {
     "UserPromptSubmit": [
       {
         "type": "command",
-        "command": "agent-router --hook",
-        "timeout": 5
+        "command": "./target/release/agent-router --hook",
+        "timeout": 5000
       }
     ]
   }
+}
+```
+
+`.vscode/settings.json`:
+```json
+{
+  "chat.useHooks": true,
+  "chat.customAgentInSubagent.enabled": true
 }
 ```
 
@@ -126,6 +135,16 @@ Instead of running a stateful MCP server, `agent-router --hook` integrates direc
 }
 ```
 
+### Hook Runtime Behavior & 35% Circuit-Breaker Lifecycle
+
+- **Normal Turn (`<= 35%` context window):**
+  - Displays a live status banner in the chat window via `systemMessage`: `⚡ AgentRouter [8.0%/35% ctx | subagent: rust-architect | skills: skills/tdd/SKILL.md]`
+  - Injects `<router_meta ... />`, an imperative `<routing_directive>` (instructing VS Code Copilot to invoke `runSubagent` for the matched custom agent and read all matched skills/prompts/instructions), and the compiled `<objective>` / `<constraints>` / `<verification>` specification via `hookSpecificOutput.additionalContext`.
+  - Appends a 1-line breadcrumb of the turn into `session.rolling_summary` (capped at 600 bytes UTF-8 safely).
+- **Hard Ceiling Turn (`> 35%` context window):**
+  - Blocks execution in the bloated chat (`"continue": false`, `"decision": "block"`, `"stopReason"` / `"reason"`), persists the compressed multi-turn handoff to `.router/HANDOFF.md`, and keeps `accumulated_tokens` pinned so any retry in the same bloated `sessionId` remains blocked.
+  - As soon as the user starts a new chat (`+` / `/clear`, changing `sessionId`), `accumulated_tokens` resets to `0`, and `.router/HANDOFF.md` is automatically injected as `<session_handoff>` on the first non-passthrough coding turn and then deleted.
+
 ## Configuration
 
 All configuration is via environment variables. API keys are read from the environment only and are never written to `.router/` state or passed as process arguments.
@@ -146,16 +165,18 @@ Injected into the spawned harness under Mode A: `ROUTED_SESSION_ID`, `ROUTED_SES
 
 Scanned for `.md` manifests, with a hand-written frontmatter parser (no `serde_yaml`) reading only `name`/`id`, `description`, and `triggers`:
 
-| Directory | Kind |
-|---|---|
-| `.agents/` | agent |
-| `.claude/agents/` | agent |
-| `.github/agents/` | agent |
-| `skills/` | skill |
-| `.claude/skills/` | skill |
-| `.github/skills/` | skill |
+| Directory | Kind | Notes |
+|---|---|---|
+| `.agents/` | `agent` | Standard agent definitions |
+| `.claude/agents/` | `agent` | Claude Code subagents |
+| `.github/agents/` | `agent` | VS Code Copilot custom agents (strips `.agent.md`) |
+| `skills/` | `skill` | Standard `SKILL.md` skills |
+| `.claude/skills/` | `skill` | Claude Code skills |
+| `.github/skills/` | `skill` | GitHub Copilot skills |
+| `.github/prompts/` | `skill` | VS Code Copilot reusable prompts (strips `.prompt.md`) |
+| `.github/instructions/` | `skill` | VS Code Copilot custom instructions (strips `.instructions.md`) |
 
-`SKILL.md` files inherit their ID from the containing directory when no `name` is declared.
+`SKILL.md` files inherit their ID from the containing directory when no `name` is declared. Repositories with zero agents and only skills/prompts/instructions route cleanly with `target_subagent = "default"` while injecting all matched skill/prompt/instruction paths into the main agent's context.
 
 ## Dependencies
 
@@ -165,39 +186,35 @@ Exactly five crates, pinned in `Cargo.lock`; `ureq` is configured `default-featu
 serde 1.0.229 · serde_json 1.0.154 · ureq 2.12.1 · xxhash-rust 0.8.19 · walkdir 2.5.0
 ```
 
-State lives in `.router/session.json` and `.router/registry.json`; both are gitignored and disposable.
+State lives in `.router/session.json`, `.router/registry.json`, and (during session handoffs) `.router/HANDOFF.md`; `.router/` is gitignored and disposable.
 
 ## Design constraints worth knowing
 
 - **Stdout is a protocol surface.** Diagnostics go to stderr exclusively, so Mode B and `--hook` output stays machine-parseable.
 - **Fail-open is unconditional.** An unreachable endpoint, a timeout, or malformed LLM/hook JSON logs a warning and routes heuristically — the pipeline never blocks the developer.
 - **Hallucinated IDs are stripped.** Anything the model returns that is not a registered agent/skill of the correct `kind` is discarded, falling back to `default`.
-- **`panic = "abort"` is deliberately narrow.** The release profile aborts on panic, so an `unwrap()` on externally-controlled data would hard-crash rather than fail open. Byte-offset slicing on untrusted UTF-8 is a real hazard here — `registry.rs` truncates at the nearest `is_char_boundary`, and `tests/pipeline.rs` guards the fail-open paths against exit code 134.
+- **`panic = "abort"` is deliberately narrow.** The release profile aborts on panic, so an `unwrap()` on externally-controlled data would hard-crash rather than fail open. Byte-offset slicing on untrusted UTF-8 is a real hazard here — `registry.rs` and `budget.rs` snap to `is_char_boundary`, and `tests/pipeline.rs` guards the fail-open paths against exit code 134.
 
 ## Verification status
 
 | Gate | Result |
 |---|---|
-| `cargo test --all-targets` | **17 passing** (4 unit, 13 integration) |
-| Linux x86_64 musl | `ldd`: `not a dynamic executable`; `readelf` NEEDED empty; **1.84 MiB** |
-| Linux aarch64 musl | `ldd`: `not a dynamic executable`; **1.57 MiB** |
+| `cargo test --all-targets` | **19 passing** (5 unit, 6 hook integration, 8 pipeline integration) |
+| Linux x86_64 musl | `ldd`: `not a dynamic executable`; `readelf` NEEDED empty; **1.83 MiB** |
+| Linux aarch64 musl | `ldd`: `not a dynamic executable`; **1.56 MiB** |
 | Windows msvc-static | builds with `crt-static`; **1.56 MiB** |
-| macOS universal | `lipo` fat file contains `x86_64 arm64`; `otool -L` free of libssl/libcrypto/sqlite3; slices **1.32 / 1.50 MiB** |
+| macOS universal | `lipo` fat file contains `x86_64 arm64`; `otool -L` free of libssl/libcrypto/sqlite3; **2.83 MiB** |
 | Fail-open smoke | routes to `.agents/rust-architect.md` with no LLM reachable, on Linux and Windows |
 
 The 5 MiB and zero-dynamic-dependency NFRs are satisfied with room to spare.
 Measured locally on the glibc host: cold and warm invocation ~1 ms with a
 stable XXH3 cache fingerprint, peak RSS ~8 MiB (NFR < 15 MB).
 
-Test coverage spans the budget ceiling math, frontmatter parsing, multibyte
-truncation, Copilot/Claude `UserPromptSubmit` hooks, Antigravity `PreInvocation`
-hooks, malformed hook input survival, fail-open, fence stripping, hallucination
-sanitising, the passthrough gate, Mode A exit-code and env propagation, cache
-invalidation, and clean-repo `--sync-tokens` calibration.
+Test coverage spans the budget ceiling math, frontmatter parsing, `.agent.md` / `.prompt.md` / `.instructions.md` suffix stripping, multibyte truncation, Copilot/Claude `UserPromptSubmit` hooks, Antigravity `PreInvocation` hooks, `transcript_path` real-time token measurement, 35% hard block + `.router/HANDOFF.md` persistence across blocked retries and passthrough turns into a fresh `sessionId`, `.github/` discovery conventions, malformed hook input survival, fail-open, fence stripping, hallucination sanitising, the passthrough gate, Mode A exit-code and env propagation, cache invalidation, and clean-repo `--sync-tokens` calibration.
 
-## CI
+## CI & Releases
 
-`.github/workflows/ci.yml` gates `cargo test --all-targets`, then builds and asserts the NFRs per platform: Linux musl x86_64/aarch64 (`ldd` + `readelf` forbidden-library scan + 5 MiB ceiling), Windows msvc-static, and a macOS universal binary created with `lipo`. Artifacts are bundled into `agent-router-0.1.0-static-binaries.tar.gz`.
+`.github/workflows/ci.yml` gates `cargo test --all-targets`, builds and asserts the NFRs per platform (Linux musl x86_64/aarch64 `ldd` + `readelf` forbidden-library scan + 5 MiB ceiling, Windows msvc-static, and macOS universal binary created with `lipo`), and runs `release-please` to automatically cut semantic-versioned GitHub Releases (`v0.3.0`) with all cross-compiled static binaries attached.
 
 ## License
 
