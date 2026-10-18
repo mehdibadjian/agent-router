@@ -72,7 +72,7 @@ pub fn run_pipeline_with_context(
                 let _ = fs::write(&handoff_file, handoff);
             }
         }
-    } else if handoff_file.exists() {
+    } else if handoff_file.exists() && !decision.passthrough {
         if let Ok(pending_handoff) = fs::read_to_string(&handoff_file) {
             let trimmed = pending_handoff.trim();
             if !trimmed.is_empty() && decision.context_handoff_summary.is_none() {

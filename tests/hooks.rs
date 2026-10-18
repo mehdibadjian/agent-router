@@ -153,7 +153,23 @@ fn hook_blocks_and_saves_handoff_when_ceiling_exceeded_then_injects_on_new_sessi
         "HANDOFF.md must remain intact until a new sessionId starts"
     );
 
-    // Next turn on a fresh host session (`sessionId` changed after `/clear` or New Chat `+`) consumes HANDOFF.md
+    // If the very first turn in the fresh session is a trivial passthrough (`git status`),
+    // HANDOFF.md must be held until the first non-passthrough coding prompt!
+    let passthrough_payload = json!({
+        "hook_event_name": "UserPromptSubmit",
+        "sessionId": "fresh-session-2",
+        "cwd": repo,
+        "prompt": "git status"
+    })
+    .to_string();
+    let (_sp, _ep, cp) = run(&repo, &["--hook"], OFFLINE, Some(&passthrough_payload));
+    assert_eq!(cp, 0);
+    assert!(
+        std::path::Path::new(&handoff_path).exists(),
+        "HANDOFF.md must not be consumed on a trivial passthrough turn"
+    );
+
+    // First real coding turn on the fresh host session consumes HANDOFF.md
     let fresh_payload = json!({
         "hook_event_name": "UserPromptSubmit",
         "sessionId": "fresh-session-2",
