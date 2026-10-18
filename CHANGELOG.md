@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/mehdibadjian/agent-router/compare/v0.2.2...v0.3.0) (2026-10-18)
+
+
+### Features
+
+* **registry:** index .github/prompts and .github/instructions as skills and strip .prompt suffix ([c90427d](https://github.com/mehdibadjian/agent-router/commit/c90427d9152e35370ab22a0fa4232fdfccd0c7fd))
+
 ## [0.2.2](https://github.com/mehdibadjian/agent-router/compare/v0.2.1...v0.2.2) (2026-10-18)
 
 
