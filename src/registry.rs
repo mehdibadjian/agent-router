@@ -13,6 +13,8 @@ const SEARCH_DIRS: &[(&str, &str)] = &[
     ("skills", "skill"),
     (".claude/skills", "skill"),
     (".github/skills", "skill"),
+    (".github/prompts", "skill"),
+    (".github/instructions", "skill"),
 ];
 
 pub fn load_or_build_registry(
@@ -104,6 +106,7 @@ pub fn parse_manifest(
         raw_stem
             .strip_suffix(".agent")
             .or_else(|| raw_stem.strip_suffix(".instructions"))
+            .or_else(|| raw_stem.strip_suffix(".prompt"))
             .unwrap_or(raw_stem)
             .to_string()
     };
@@ -195,6 +198,14 @@ mod tests {
             md,
         );
         assert_eq!(instr.id, "coding-style");
+
+        let prompt = parse_manifest(
+            Path::new("/repo"),
+            Path::new("/repo/.github/prompts/refactor.prompt.md"),
+            "skill",
+            md,
+        );
+        assert_eq!(prompt.id, "refactor");
     }
 
     #[test]

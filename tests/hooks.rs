@@ -239,8 +239,10 @@ fn github_agents_and_skills_directories_are_discovered() {
     let repo = fixture_repo("hook-github-dirs");
     std::fs::create_dir_all(format!("{}/.github/agents", repo)).unwrap();
     std::fs::create_dir_all(format!("{}/.github/skills/gh-actions", repo)).unwrap();
+    std::fs::create_dir_all(format!("{}/.github/prompts", repo)).unwrap();
+    std::fs::create_dir_all(format!("{}/.github/instructions", repo)).unwrap();
 
-    // Omit `name:` in frontmatter to verify `.agent.md` double-extension stripping
+    // Omit `name:` in frontmatter to verify `.agent.md`, `.prompt.md`, and `.instructions.md` double-extension stripping
     std::fs::write(
         format!("{}/.github/agents/ci-bot.agent.md", repo),
         "---\ndescription: GitHub Actions specialist\ntriggers: [workflow, pipeline]\n---\n",
@@ -249,6 +251,16 @@ fn github_agents_and_skills_directories_are_discovered() {
     std::fs::write(
         format!("{}/.github/skills/gh-actions/SKILL.md", repo),
         "---\nname: gh-actions\ndescription: Actions YAML rules\ntriggers: [workflow]\n---\n",
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{}/.github/prompts/deploy-check.prompt.md", repo),
+        "---\ndescription: Deployment checklist prompt\ntriggers: [workflow]\n---\n",
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{}/.github/instructions/ci-security.instructions.md", repo),
+        "---\ndescription: CI security instructions\ntriggers: [pipeline]\n---\n",
     )
     .unwrap();
 
@@ -267,7 +279,9 @@ fn github_agents_and_skills_directories_are_discovered() {
         .as_str()
         .expect("additionalContext string");
     assert!(ctx.contains("subagent=\"ci-bot\""));
-    assert!(ctx.contains("skills=\".github/skills/gh-actions/SKILL.md\""));
+    assert!(ctx.contains(".github/skills/gh-actions/SKILL.md"));
+    assert!(ctx.contains(".github/prompts/deploy-check.prompt.md"));
+    assert!(ctx.contains(".github/instructions/ci-security.instructions.md"));
 }
 
 #[test]
