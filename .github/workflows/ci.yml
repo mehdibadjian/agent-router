@@ -8,7 +8,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -267,11 +268,132 @@ jobs:
         run: |
           set -euo pipefail
           find dist -type f | sort
-          tar -czf agent-router-0.1.0-static-binaries.tar.gz -C dist .
-          ls -l agent-router-0.1.0-static-binaries.tar.gz
+          mkdir -p release-assets
+          cp dist/agent-router-x86_64-unknown-linux-musl/agent-router release-assets/agent-router-x86_64-unknown-linux-musl
+          cp dist/agent-router-aarch64-unknown-linux-musl/agent-router release-assets/agent-router-aarch64-unknown-linux-musl
+          cp dist/agent-router-x86_64-pc-windows-msvc/agent-router.exe release-assets/agent-router-x86_64-pc-windows-msvc.exe
+          cp dist/agent-router-macos-universal/agent-router-universal release-assets/agent-router-macos-universal
+          chmod +x release-assets/agent-router-x86_64-unknown-linux-musl \
+                   release-assets/agent-router-aarch64-unknown-linux-musl \
+                   release-assets/agent-router-macos-universal
+          tar -czf release-assets/agent-router-static-binaries.tar.gz -C dist .
+          cp release-assets/agent-router-static-binaries.tar.gz agent-router-0.1.0-static-binaries.tar.gz
+          ls -la release-assets/
 
       - uses: actions/upload-artifact@v4
         with:
           name: agent-router-static-bundle
-          path: agent-router-0.1.0-static-binaries.tar.gz
+          path: release-assets/*
           if-no-files-found: error
+
+  # Run release-please on main and auto-approve/auto-cut tags & GitHub Releases.
+  release-please:
+    name: Release Please
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: [test]
+    outputs:
+      release_created: ${{ steps.final.outputs.release_created }}
+      tag_name: ${{ steps.final.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run release-please
+        id: rp
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Auto-approve and finalize release if Release PR was opened
+        id: auto
+        if: steps.rp.outputs.release_created != 'true' && steps.rp.outputs.pr != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RP_PR_JSON: ${{ steps.rp.outputs.pr }}
+        run: |
+          set -euo pipefail
+          PR_NUM="$(echo "$RP_PR_JSON" | jq -r '.number')"
+          HEAD_BRANCH="$(echo "$RP_PR_JSON" | jq -r '.headBranchName')"
+          PR_TITLE="$(echo "$RP_PR_JSON" | jq -r '.title')"
+          PR_BODY="$(echo "$RP_PR_JSON" | jq -r '.body')"
+          echo "Detected Release PR #${PR_NUM} (${HEAD_BRANCH}): ${PR_TITLE}"
+
+          # Attempt squash-merge of the Release PR into main
+          if gh pr merge "$PR_NUM" --squash --delete-branch; then
+            echo "Merged Release PR #${PR_NUM}; pulling updated main..."
+            git fetch origin main
+            git checkout -B main origin/main
+            echo "merged_pr=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Direct bot PR merge blocked by branch ruleset; cutting tag & GitHub Release directly from Release PR metadata..."
+            git fetch origin "$HEAD_BRANCH"
+            NEW_VER="$(git show "origin/${HEAD_BRANCH}:.release-please-manifest.json" | jq -r '.["."]')"
+            TAG="v${NEW_VER}"
+            echo "Target tag: ${TAG}"
+            if ! gh release view "$TAG" >/dev/null 2>&1; then
+              gh release create "$TAG" \
+                --target "${{ github.sha }}" \
+                --title "AgentRouter ${TAG}" \
+                --notes "$PR_BODY"
+            fi
+            echo "direct_release_created=true" >> "$GITHUB_OUTPUT"
+            echo "direct_tag_name=${TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cut release from newly merged Release PR
+        id: rp2
+        if: steps.auto.outputs.merged_pr == 'true'
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Export release outputs
+        id: final
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.rp.outputs.release_created }}" = "true" ]; then
+            echo "release_created=true" >> "$GITHUB_OUTPUT"
+            echo "tag_name=${{ steps.rp.outputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.rp2.outputs.release_created }}" = "true" ]; then
+            echo "release_created=true" >> "$GITHUB_OUTPUT"
+            echo "tag_name=${{ steps.rp2.outputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.auto.outputs.direct_release_created }}" = "true" ]; then
+            echo "release_created=true" >> "$GITHUB_OUTPUT"
+            echo "tag_name=${{ steps.auto.outputs.direct_tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_created=false" >> "$GITHUB_OUTPUT"
+            echo "tag_name=" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Attach the cross-compiled static binaries to the GitHub Release created by release-please.
+  publish-release:
+    name: Upload Release Assets
+    if: needs.release-please.outputs.release_created == 'true' && needs.release-please.outputs.tag_name != ''
+    runs-on: ubuntu-latest
+    needs: [release-please, release-bundle]
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.release-please.outputs.tag_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-router-static-bundle
+          path: assets
+
+      - name: Upload static binaries to GitHub Release
+        run: |
+          set -euo pipefail
+          ls -la assets/
+          cp assets/agent-router-static-binaries.tar.gz "assets/agent-router-${TAG}-static-binaries.tar.gz"
+          gh release upload "$TAG" \
+            assets/agent-router-x86_64-unknown-linux-musl \
+            assets/agent-router-aarch64-unknown-linux-musl \
+            assets/agent-router-x86_64-pc-windows-msvc.exe \
+            assets/agent-router-macos-universal \
+            "assets/agent-router-${TAG}-static-binaries.tar.gz" \
+            --clobber
+
