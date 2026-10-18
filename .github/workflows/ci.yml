@@ -10,6 +10,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -327,6 +328,11 @@ jobs:
             git fetch origin main
             git checkout -B main origin/main
             echo "merged_pr=true" >> "$GITHUB_OUTPUT"
+            # Clean up any phantom pull_request workflow runs queued on the deleted release-please branch
+            sleep 3
+            for run_id in $(gh run list --branch "$HEAD_BRANCH" --event pull_request --json databaseId -q '.[].databaseId' 2>/dev/null || true); do
+              gh run delete "$run_id" || true
+            done
           else
             echo "Direct bot PR merge blocked by branch ruleset; cutting tag & GitHub Release directly from Release PR metadata..."
             git fetch origin "$HEAD_BRANCH"
