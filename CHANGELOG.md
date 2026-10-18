@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/mehdibadjian/agent-router/compare/v0.2.1...v0.2.2) (2026-10-18)
+
+
+### Bug Fixes
+
+* **hook:** hold HANDOFF.md across trivial passthrough turns in new session ([ef5733b](https://github.com/mehdibadjian/agent-router/commit/ef5733b015daa76d83d7086c37a444ee96a81f75))
+
 ## [0.2.1](https://github.com/mehdibadjian/agent-router/compare/v0.2.0...v0.2.1) (2026-10-18)
 
 
