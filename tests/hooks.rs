@@ -85,6 +85,18 @@ fn agy_pre_invocation_hook_reads_transcript_and_emits_inject_steps() {
 #[test]
 fn hook_blocks_and_saves_handoff_when_ceiling_exceeded_then_injects_on_new_session() {
     let repo = fixture_repo("hook-reset");
+
+    // Turn 1 (normal turn): builds rolling_summary breadcrumb before hitting ceiling
+    let turn1_payload = json!({
+        "hookEventName": "UserPromptSubmit",
+        "sessionId": "vscode-session-1",
+        "cwd": repo,
+        "prompt": "design ast node structs"
+    })
+    .to_string();
+    let (_s1, _e1, c1) = run(&repo, &["--hook"], OFFLINE, Some(&turn1_payload));
+    assert_eq!(c1, 0);
+
     let (_s, _e, code) = run(&repo, &["--sync-tokens", "36000"], OFFLINE, None);
     assert_eq!(code, 0);
 
@@ -115,6 +127,10 @@ fn hook_blocks_and_saves_handoff_when_ceiling_exceeded_then_injects_on_new_sessi
         .expect("additionalContext string");
     assert!(ctx.contains("action=\"START_NEW_SESSION\""));
     assert!(ctx.contains("<session_handoff>"));
+    assert!(
+        ctx.contains("design ast node structs"),
+        "handoff must include prior turn breadcrumb from rolling_summary"
+    );
 
     // Verify `.router/HANDOFF.md` was persisted for the fresh session
     let handoff_path = format!("{}/.router/HANDOFF.md", repo);
@@ -123,7 +139,21 @@ fn hook_blocks_and_saves_handoff_when_ceiling_exceeded_then_injects_on_new_sessi
         "HANDOFF.md must be written when >35% reset triggers"
     );
 
-    // Next turn on a fresh host session (`session_id` changed after `/clear` or New Chat `+`) consumes HANDOFF.md
+    // If user ignores the block and sends another prompt in the SAME `sessionId`, it must keep blocking!
+    let (stdout_retry, _stderr_retry, code_retry) =
+        run(&repo, &["--hook"], OFFLINE, Some(&stdin_payload));
+    assert_eq!(code_retry, 0);
+    let resp_retry: Value = serde_json::from_str(stdout_retry.trim()).expect("valid hook JSON");
+    assert_eq!(
+        resp_retry["continue"], false,
+        "retrying in the same bloated sessionId must remain blocked"
+    );
+    assert!(
+        std::path::Path::new(&handoff_path).exists(),
+        "HANDOFF.md must remain intact until a new sessionId starts"
+    );
+
+    // Next turn on a fresh host session (`sessionId` changed after `/clear` or New Chat `+`) consumes HANDOFF.md
     let fresh_payload = json!({
         "hook_event_name": "UserPromptSubmit",
         "sessionId": "fresh-session-2",
@@ -144,6 +174,10 @@ fn hook_blocks_and_saves_handoff_when_ceiling_exceeded_then_injects_on_new_sessi
     assert!(
         ctx2.contains("<session_handoff>"),
         "fresh session first turn must inject saved handoff"
+    );
+    assert!(
+        ctx2.contains("design ast node structs"),
+        "fresh session handoff must preserve original Turn 1 breadcrumb"
     );
     assert!(
         !std::path::Path::new(&handoff_path).exists(),

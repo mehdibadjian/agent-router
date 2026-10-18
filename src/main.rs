@@ -67,8 +67,10 @@ pub fn run_pipeline_with_context(
 
     // Persist or consume `.router/HANDOFF.md` across blocked -> fresh session transitions
     if eval.must_reset_session {
-        if let Some(ref handoff) = decision.context_handoff_summary {
-            let _ = fs::write(&handoff_file, handoff);
+        if !handoff_file.exists() {
+            if let Some(ref handoff) = decision.context_handoff_summary {
+                let _ = fs::write(&handoff_file, handoff);
+            }
         }
     } else if handoff_file.exists() {
         if let Ok(pending_handoff) = fs::read_to_string(&handoff_file) {
@@ -81,12 +83,19 @@ pub fn run_pipeline_with_context(
     }
 
     // Commit Updated Token Ledger
+    let prior_tokens = session.accumulated_tokens;
     budget::commit_turn_to_ledger(
         &mut session,
         &eval,
+        raw_prompt,
         &decision.compiled_prompt,
         decision.context_handoff_summary.clone(),
     );
+    // If we are in Hook mode (`host_session_id.is_some()`) and blocked the turn (`must_reset_session`),
+    // keep `accumulated_tokens` pinned until `host_session_id` actually changes on New Chat (`+`)!
+    if eval.must_reset_session && host_session_id.is_some() {
+        session.accumulated_tokens = prior_tokens;
+    }
     budget::save_session(&session_file, &session).map_err(|e| e.to_string())?;
 
     eprintln!(

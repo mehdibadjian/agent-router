@@ -57,6 +57,7 @@ pub fn evaluate_budget(
 pub fn commit_turn_to_ledger(
     session: &mut SessionState,
     eval: &BudgetEvaluation,
+    raw_prompt: &str,
     compiled_prompt: &str,
     handoff_summary: Option<String>,
 ) {
@@ -69,6 +70,30 @@ pub fn commit_turn_to_ledger(
         session.rolling_summary = handoff;
     } else {
         session.accumulated_tokens += compiled_tokens;
+        let snippet: String = raw_prompt
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect();
+        if !snippet.is_empty() {
+            if !session.rolling_summary.is_empty() {
+                session.rolling_summary.push_str(" -> ");
+            }
+            session.rolling_summary.push_str(&snippet);
+            // Cap rolling_summary to last ~600 chars (UTF-8 safe)
+            if session.rolling_summary.len() > 600 {
+                let mut start = session.rolling_summary.len() - 600;
+                while start < session.rolling_summary.len()
+                    && !session.rolling_summary.is_char_boundary(start)
+                {
+                    start += 1;
+                }
+                session.rolling_summary = session.rolling_summary[start..].to_string();
+            }
+        }
     }
 }
 
