@@ -1,42 +1,80 @@
 # Zero-Hallucination Implementation Plan
 
-**Project:** AgentRouter (Zero-Dependency System 1 Pre-Processor & Subagent Dispatcher)
-**Document Version:** 1.1 (`v0.3.0`)
-**Date:** October 18, 2026
+**Project:** AgentRouter (Zero-Dependency System 1 / System 2 Cognitive Engine + Subagent Dispatcher)
+**Document Version:** 2.0 (`v2.0.0`)
+**Date:** October 21, 2026
 **Companion Document:** [BRD.md](./BRD.md)
 
 This Zero-Hallucination Implementation Plan is structured as an execution-ready blueprint you can hand directly to a coding agent (or follow file-by-file). It locks down exact crate versions, prohibits unrequested dependencies (no tokio, no openssl, no clap, no serde_yaml), defines every struct and function signature, and includes deterministic unit tests for every module.
 
+> **Reading order for v2.0.0:** §1–§4 and §6 describe the current workspace and are authoritative. §5 preserves the v0.3.0 single-package file-by-file specification verbatim as the historical record — its module paths (`src/budget.rs`, `src/dispatcher.rs`, …) no longer exist, and §6 maps each of those files to the crate that absorbed it.
+
 ## 1. Anti-Hallucination Guardrails (Agent Constraints)
 
-Any coding agent executing this specification MUST obey these five hard rules:
+Any coding agent executing this specification MUST obey these hard rules:
 
-* **Strict Crate Lock:** Only the 5 crates in `Cargo.toml` are permitted (`serde`, `serde_json`, `ureq`, `xxhash-rust`, `walkdir`). Do not add `clap`, `tokio`, `reqwest`, `anyhow`, `regex`, or `serde_yaml`.
+* **Strict Crate Lock:** Only the 5 crates in `[workspace.dependencies]` are permitted (`serde`, `serde_json`, `ureq`, `xxhash-rust`, `walkdir`). Do not add `clap`, `tokio`, `reqwest`, `anyhow`, `regex`, or `serde_yaml`. `xxhash-rust` is enabled with the `xxh64` feature only.
 * **Synchronous I/O Only:** All HTTP, filesystem, and stdin/stdout hook JSON operations must use blocking standard library I/O (`std::io`, `std::fs`, `ureq`).
-* **Pure-Rust TLS:** `ureq` v2.10 must be configured with `default-features = false` and `features = ["tls", "json"]` so it compiles `rustls` statically without linking system OpenSSL.
-* **Stdout Purity:** Never use `println!` for logging or diagnostics—stdout is strictly reserved for the JSON routing contract and lifecycle hook responses. All warnings/logs must use `eprintln!`.
-* **Fail-Open Mandate:** Network timeouts, malformed LLM JSON, or missing API keys must never panic or crash the binary; they must fall back deterministically to `FallbackDecision`.
+* **Pure-Rust TLS, Feature-Gated:** `ureq` v2.10 must be configured with `default-features = false` and `features = ["tls", "json"]` so it compiles `rustls` statically without linking system OpenSSL. In `s1s2-core` it is `optional = true` behind the `llm` feature, so the engine's default graph contains zero network code.
+* **Static Dispatch Only:** Domains plug in through the `CognitiveDomain` trait and generic `CognitiveEngine<D>`. No `dyn Trait`, no vtables, no `async`, no executor.
+* **Stdout Purity:** Never use `println!` for logging or diagnostics—stdout is strictly reserved for the JSON routing contract, lifecycle hook responses, and MCP JSON-RPC framing. All warnings/logs must use `eprintln!`.
+* **Fail-Open Mandate:** Network timeouts, malformed LLM JSON, or missing API keys must never panic or crash the binary; they must fall back deterministically to the local compiler.
+* **Contract Freeze:** `bins/agent-router/tests/pipeline.rs` and `bins/agent-router/tests/hooks.rs` are the v0.3.0 wire contract. They may not be edited to accommodate a refactor; the refactor must satisfy them as written.
 
 ## 2. Repository Directory Layout
 
 ```
 agent-router/
 ├── .cargo/
-│   └── config.toml        # Static linking flags for Linux musl & Windows MSVC
+│   └── config.toml              # Static linking flags for Linux musl & Windows MSVC
 ├── .github/
-│   └── hooks/
-│       └── agent-router.json # VS Code Copilot UserPromptSubmit hook config
+│   ├── hooks/
+│   │   └── agent-router.json    # VS Code Copilot UserPromptSubmit hook config
+│   └── workflows/ci.yml         # workspace tests + 4-platform static matrix
 ├── .vscode/
-│   └── settings.json      # Enables chat.useHooks and customAgentInSubagent
-├── Cargo.toml             # Locked dependencies & size-optimized release profile
-└── src/
-    ├── main.rs            # CLI parser (std::env::args) & orchestration pipeline
-    ├── types.rs           # Shared data contracts & serde structs
-    ├── budget.rs          # Step 0: Token estimator, rolling breadcrumbs & 35% circuit breaker
-    ├── registry.rs        # Step 2: XXH3 mtime scanner & frontmatter parser
-    ├── compiler.rs        # Step 1: Low-cost LLM client, prompt compiler & fail-open fallback
-    ├── dispatcher.rs      # Step 3: CLI subprocess spawner & stdout JSON emitter
-    └── hook.rs            # Step 3 (Mode C): Synchronous lifecycle hook adapter (--hook)
+│   └── settings.json            # Enables chat.useHooks and customAgentInSubagent
+├── bins/
+│   └── agent-router/            # Thin CLI / hook / MCP binary (no cognitive policy)
+│       ├── Cargo.toml
+│       ├── src/
+│       │   ├── main.rs          # std::env::args dispatcher: --prompt/--hook/--mcp-stdio/--wrap/--sync-tokens
+│       │   ├── pipeline.rs      # Ledger state in, CognitiveEnvelope out; .router/ persistence
+│       │   ├── envelope.rs      # v0.3.0 stdout contract + additive `cognitive` block + ROUTED_* map
+│       │   ├── hook.rs          # Mode C: Copilot / Claude / Antigravity lifecycle hooks
+│       │   └── mcp.rs           # Mode D: MCP tool adapters over the stdio JSON-RPC server
+│       └── tests/
+│           ├── common/mod.rs    # Legacy temp-repo fixture (unchanged)
+│           ├── pipeline.rs      # v0.3.0 CLI contract suite — MUST pass unmodified
+│           ├── hooks.rs         # v0.3.0 hook contract suite — MUST pass unmodified
+│           └── harness.rs       # v2.0.0 CLI + MCP surface
+├── crates/
+│   ├── s1s2-core/               # Reusable engine: zero domain knowledge, network-free by default
+│   │   ├── Cargo.toml           # ureq is optional, behind the `llm` feature
+│   │   ├── src/
+│   │   │   ├── lib.rs           # CognitiveEngine<D> coordinator + CognitiveEnvelope + ExecutionPathway
+│   │   │   ├── domain.rs        # CognitiveDomain trait, GateVerdict, EscalationReason, CircuitTrip
+│   │   │   ├── gate.rs          # MetacognitiveGate pure decision function
+│   │   │   ├── s1/cache.rs      # MtimeCache: xxh64 over sorted path:mtime_nanos:size lines
+│   │   │   ├── s1/circuit.rs    # CircuitBreaker, token estimate, 0.30 warn / 0.35 ceiling
+│   │   │   ├── s2/xml_compiler.rs # XmlEnvelopeBuilder with entity escaping + attr sanitizing
+│   │   │   ├── s2/llm.rs        # feature-gated OpenAI-compatible chat completion client
+│   │   │   ├── s2/handoff.rs    # SessionLedger, commit_turn, render_handoff_artifact
+│   │   │   └── harness/
+│   │   │       ├── cli.rs       # SpawnRequest / spawn (exit-code propagation) / emit_json
+│   │   │       └── mcp.rs       # McpServer: newline-delimited JSON-RPC 2.0 over stdio
+│   │   └── tests/mock_domain.rs # Acceptance: a second domain plugs in without engine edits
+│   └── ext-agent-router/        # Extension #1: developer subagent routing domain
+│       ├── Cargo.toml
+│       ├── src/
+│       │   ├── lib.rs           # impl CognitiveDomain for AgentRoutingDomain + gate/s2 policy
+│       │   ├── types.rs         # PromptInput, RouterConfig, RoutingDecision, AgentRegistry
+│       │   ├── registry.rs      # Directory discovery + hand-rolled frontmatter parser
+│       │   ├── heuristics.rs    # Deterministic lexical scoring, trivial-passthrough gate
+│       │   └── compiler.rs      # Deterministic templates, XML envelope, adjudication
+│       └── tests/pathways.rs    # The 5 spec-mandated acceptance scenarios
+├── docs/                        # BRD.md, IMPLEMENTATION_PLAN.md
+├── Cargo.toml                   # Virtual workspace manifest + dependency allowlist
+└── Cargo.lock                   # Pinned transitive set (rustls + ring, no OpenSSL)
 ```
 
 ## 3. Configuration & Build Manifests
@@ -54,20 +92,39 @@ rustflags = ["-C", "target-feature=+crt-static"]
 rustflags = ["-C", "target-feature=+crt-static"]
 ```
 
-### File 2: `Cargo.toml`
+### File 2: `Cargo.toml` (virtual workspace root)
+
+The root manifest owns three things and nothing else: the member list, the dependency
+allowlist, and the size-optimized release profile. `[workspace.package].version` is the
+**single** version literal in the repository — release tooling bumps that one field and
+every member inherits it.
 
 ```toml
-[package]
-name = "agent-router"
-version = "0.3.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = [
+    "crates/s1s2-core",
+    "crates/ext-agent-router",
+    "bins/agent-router",
+]
 
-[dependencies]
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+repository = "https://github.com/mehdibadjian/agent-router"
+
+# Allowed dependency set (spec §2): no async runtime, no OpenSSL/C bindings.
+[workspace.dependencies]
 serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.128"
-ureq = { version = "2.10.1", default-features = false, features = ["tls", "json"] }
-xxhash-rust = { version = "0.8.12", features = ["xxh3"] }
+xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
 walkdir = "2.5.0"
+ureq = { version = "2.10.1", default-features = false, features = ["tls", "json"] }
+
+# Workspace-internal path dependencies carry no version: the release tooling bumps a
+# single field, `[workspace.package].version`, and every member inherits it.
+s1s2-core = { path = "crates/s1s2-core" }
+ext-agent-router = { path = "crates/ext-agent-router" }
 
 [profile.release]
 opt-level = "z"
@@ -77,9 +134,187 @@ strip = true
 panic = "abort"
 ```
 
-## 4. Module-by-Module Code Specifications
+### File 3: `crates/s1s2-core/Cargo.toml`
 
-### File 3: `src/types.rs` (Canonical Data Contracts)
+```toml
+[package]
+name = "s1s2-core"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Reusable zero-dependency System 1 / System 2 cognitive engine"
+
+[features]
+default = []
+# System 2 external LLM adjudication via ureq. Off by default so the core
+# engine stays network-free and binary-size-neutral for extensions that
+# never escalate to a remote adjudicator.
+llm = ["dep:ureq"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+xxhash-rust = { workspace = true }
+walkdir = { workspace = true }
+ureq = { workspace = true, optional = true }
+```
+
+### File 4: `crates/ext-agent-router/Cargo.toml`
+
+```toml
+[package]
+name = "ext-agent-router"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Extension #1 for s1s2-core: developer subagent routing domain"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+walkdir = { workspace = true }
+s1s2-core = { workspace = true, features = ["llm"] }
+```
+
+### File 5: `bins/agent-router/Cargo.toml`
+
+```toml
+[package]
+name = "agent-router"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "System 1 / System 2 cognitive router CLI and MCP stdio server"
+
+[[bin]]
+name = "agent-router"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+s1s2-core = { workspace = true }
+ext-agent-router = { workspace = true }
+```
+
+## 4. v2.0.0 Module Contracts
+
+### 4.1 `s1s2-core::domain` — the plug-in surface
+
+Five associated types and six required methods; everything else is a defaulted hook so a
+new domain can start from the trait alone.
+
+```rust
+pub trait CognitiveDomain: Sized + Send + Sync + 'static {
+    type Input: fmt::Debug + Clone + DeserializeOwned + Serialize;
+    type RegistryState: fmt::Debug + Clone + Serialize + DeserializeOwned + Default;
+    type FastOutput: fmt::Debug + Clone + Serialize;
+    type FinalDecision: fmt::Debug + Clone + Serialize + DeserializeOwned;
+    type Config: fmt::Debug + Clone;
+
+    fn build_registry(config: &Self::Config) -> Result<Self::RegistryState, String>;
+    fn measure_budget(input: &Self::Input, config: &Self::Config) -> (usize, usize);
+    fn execute_system1(input: &Self::Input, registry: &Self::RegistryState, config: &Self::Config)
+        -> Result<Self::FastOutput, String>;
+    fn evaluate_gate(input: &Self::Input, s1_out: Self::FastOutput, saturation_ratio: f32,
+                     config: &Self::Config, breaker: &CircuitBreaker)
+        -> GateVerdict<Self::FinalDecision>;
+    fn execute_system2(input: &Self::Input, registry: &Self::RegistryState,
+                      partial_decision: Option<Self::FinalDecision>, reason: &EscalationReason,
+                      config: &Self::Config) -> Result<Self::FinalDecision, String>;
+    fn handle_circuit_trip(input: &Self::Input, trip: CircuitTrip, config: &Self::Config)
+        -> Result<Self::FinalDecision, String>;
+
+    // Defaults: annotate_pathway, domain_id, watched_dirs, cache_file,
+    //           registry_extensions() == ["md"], cache_payload_key() == "payload".
+}
+```
+
+```rust
+pub enum GateVerdict<FastOut> {
+    FastCommit(FastOut),
+    Escalate { partial: Option<FastOut>, reason: EscalationReason },
+    Halt(CircuitTrip),
+}
+
+pub enum ExecutionPathway { System1Fast, System2Escalated(EscalationReason), CircuitHalted(CircuitTrip) }
+
+pub struct CognitiveEnvelope<Out> {
+    pub pathway: ExecutionPathway,
+    pub saturation_ratio: f32,
+    pub latency_micros: u128,
+    pub cache_hit: bool,
+    pub decision: Out,
+}
+```
+
+`EscalationReason` and `CircuitTrip` implement `Display` as machine-readable slugs
+(`low-confidence:0.600/0.850`, `saturation-exceeded:0.375>0.350`) that are reused verbatim
+in the `cognitive.pathway` envelope field and in `ROUTED_PATHWAY`.
+
+### 4.2 `s1s2-core` — engine and subsystems
+
+| File | Contract |
+|---|---|
+| `lib.rs` | `CognitiveEngine::<D>::new(config, CircuitBreakerConfig)`; `process(&mut, &Input) -> Result<CognitiveEnvelope<FinalDecision>, String>`; `budget_check` (no commit), `refresh_registry` (invalidate), `rebuild_registry` (invalidate + rebuild). Order is fixed: cache → budget → breaker trip check → System 1 → gate → System 2/halt, with `D::annotate_pathway` applied on every exit. |
+| `gate.rs` | `MetacognitiveGate::new(confidence_threshold, soft_warning_ratio).evaluate(SwitchSignals) -> SwitchOutcome`; order `force_system2` → saturation → confidence → candidate count → commit. |
+| `s1/circuit.rs` | `estimate_tokens = ceil(chars/3.6) + (punct_or_newline)/3` (byte-identical to v0.3.0); `DEFAULT_SOFT_WARNING_RATIO = 0.30`, `DEFAULT_HARD_CEILING_RATIO = 0.35`, `DEFAULT_CONTEXT_WINDOW = 200_000`; `round_ratio(r) = (r*1000).round()/1000`; `CircuitBreaker::{read, trip, config}`. |
+| `s1/cache.rs` | `MtimeCache<T>::load_or_build(&[PathBuf], FnOnce(&[PathBuf]) -> Result<T, String>) -> Result<CacheState<T>, String>`; fingerprint = `xxh64` (seed 0) over sorted `path:mtime_nanos:size\|` lines filtered by `registry_extensions`; document `{"hash": n, "<payload_key>": T}`. |
+| `s2/xml_compiler.rs` | `XmlEnvelopeBuilder::{new, open, text_tag, close, finish}`; body entities escaped, attribute values sanitized, invalid tag names fenced. Untrusted text can never close an envelope it does not own. |
+| `s2/llm.rs` | `chat_completion(url, key, model, timeout_ms, system, user) -> Result<Value, String>` and `assistant_content(&Value) -> Result<&str, String>`; compiled only with `--features llm`. |
+| `s2/handoff.rs` | `SessionLedger` (adds `turn_count`, `last_pathway` with serde defaults), `commit_turn(...)`, `load_ledger`/`save_ledger`, `render_handoff_artifact(&ledger, &HandoffCause, ratio, max) -> String`, `PathwayKind::{legacy_action, slug}`. |
+| `harness/cli.rs` | `SpawnRequest::{new, arg, env}`; `spawn(&SpawnRequest) -> Result<i32, String>` propagating the child exit code; `emit_json` / `to_json_string`. |
+| `harness/mcp.rs` | `McpServer::new(name, version).tool(McpTool::new(name, description, schema, handler)).serve_stdio()`; `handle_line` is pure and testable. Notification (no `id`) ⇒ no output; handler `Err` ⇒ `result.isError = true`. |
+
+### 4.3 `ext-agent-router` — Extension #1
+
+| Item | Value |
+|---|---|
+| Associated types | `Input = PromptInput`, `RegistryState = AgentRegistry`, `FastOutput = HeuristicCandidate`, `FinalDecision = RoutingDecision`, `Config = RouterConfig` |
+| Hooks overridden | `domain_id() = "agent-router"`, `cache_file() = .router/registry.json`, `cache_payload_key() = "entries"`, `registry_extensions() = ["md"]`, `watched_dirs() = config.search_dirs`, `annotate_pathway() = decision.pathway_metadata` |
+| Gate policy | ceiling re-checked in-domain (defence in depth) → trivial passthrough → `MetacognitiveGate::new(0.85, soft_warning_ratio)` |
+| System 2 | `compiler::adjudicate` when `config.llm.enabled`, else/failed → `deterministic()` (XML envelope + capability-matrix tie-break) |
+| Halt | `handle_circuit_trip` emits `<circuit_breaker_tripped max="0.35" saturation="…" action="START_NEW_SESSION">` with a `<compaction_directive>`, the legacy summary line, and `render_handoff_artifact` |
+
+### 4.4 `bins/agent-router` — harness only
+
+`pipeline::run_turn(repo_root, raw_prompt, observed_transcript_tokens, host_session_id, force_compile)`
+is the single entry point shared by the CLI, the hook, and MCP. It owns ledger load/reset,
+`.router/HANDOFF.md` write-on-block / consume-on-first-non-passthrough-turn, the pin-on-block
+rule for hook sessions, `commit_turn`, and the stderr diagnostics line. It never scores,
+selects, or compiles.
+
+## 5. Step-by-Step Build & Verification Sequence (v2.0.0)
+
+1. `cargo build --workspace --all-targets` — must emit **zero warnings**.
+2. `cargo test --workspace --all-targets` — 83 tests: 36 `s1s2-core` (35 unit + `mock_domain`),
+   24 `ext-agent-router` (20 unit + 4 pathways), 23 `agent-router` (1 unit + 8 harness + 6 hooks + 8 pipeline).
+3. `cargo tree -p s1s2-core | grep -c ureq` — must print `0`; `--features llm` makes it `1`.
+4. `cargo build --release` then `ls -l target/release/agent-router` — the artifact path is
+   unchanged by the workspace layout, so `.github/hooks/agent-router.json` and the CI
+   bundling steps need no edits.
+5. Backward-compatibility probe: run the legacy suites alone
+   (`cargo test -p agent-router --test pipeline --test hooks`) before touching any harness code.
+6. v2 surface probe: `printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | ./target/release/agent-router --mcp-stdio`.
+
+Legacy → v2 file mapping (for readers of §6):
+
+| v0.3.0 | v2.0.0 owner |
+|---|---|
+| `src/types.rs` | `crates/ext-agent-router/src/types.rs` (+ `s1s2-core::s2::handoff::SessionLedger` for the ledger) |
+| `src/budget.rs` | `crates/s1s2-core/src/s1/circuit.rs` (estimator + breaker) and `ext-agent-router::AgentRoutingDomain::measure_budget` |
+| `src/registry.rs` | `crates/s1s2-core/src/s1/cache.rs` (fingerprint/persist) + `crates/ext-agent-router/src/registry.rs` (discovery + frontmatter) |
+| `src/compiler.rs` | `crates/s1s2-core/src/s2/{xml_compiler,llm}.rs` + `crates/ext-agent-router/src/{heuristics,compiler}.rs` |
+| `src/dispatcher.rs` | `crates/s1s2-core/src/harness/cli.rs` + `bins/agent-router/src/envelope.rs` |
+| `src/hook.rs` | `bins/agent-router/src/hook.rs` (rewritten on top of `pipeline`) |
+| `src/main.rs` | `bins/agent-router/src/{main,pipeline,mcp}.rs` |
+
+## 6. Historical: v0.3.0 Module-by-Module Code Specifications
+
+The sections below are the v0.3.0 blueprint as written, retained for provenance. The paths
+refer to the pre-workspace single-package layout; §5 maps each file to its v2 owner.
+
+### Legacy File 3: `src/types.rs` (Canonical Data Contracts)
 
 Defines every state file and output payload so no module invents ad-hoc JSON keys.
 
@@ -163,7 +398,7 @@ pub struct PromptPayload {
 }
 ```
 
-### File 4: `src/budget.rs` (Step 0: Token Estimator & 35% Circuit Breaker)
+### Legacy File 4: `src/budget.rs` (Step 0: Token Estimator & 35% Circuit Breaker)
 
 Implements zero-dependency BPE token estimation, ledger persistence, turn-by-turn `rolling_summary` breadcrumb accumulation, and the 35% hard ceiling.
 
@@ -300,7 +535,7 @@ mod tests {
 }
 ```
 
-### File 5: `src/registry.rs` (Step 2: Mtime-Cached Skill & Agent Scanner)
+### Legacy File 5: `src/registry.rs` (Step 2: Mtime-Cached Skill & Agent Scanner)
 
 Includes a zero-dependency YAML frontmatter extractor so the router reads `name`, `description`, and `triggers` without pulling in `serde_yaml`, and indexes `.github/agents`, `.github/skills`, `.github/prompts`, and `.github/instructions`.
 
@@ -526,7 +761,7 @@ mod tests {
 }
 ```
 
-### File 6: `src/compiler.rs` (Step 1: Prompt Compiler & Fail-Open Fallback)
+### Legacy File 6: `src/compiler.rs` (Step 1: Prompt Compiler & Fail-Open Fallback)
 
 Implements the complexity passthrough check, the deterministic prompt-engineering system prompt, Hallucination Guard validation (stripping any invented agent/skill IDs), and the offline keyword fallback.
 
@@ -748,7 +983,7 @@ pub fn build_fallback_decision(
 }
 ```
 
-### File 7: `src/dispatcher.rs` (Step 3: Harness-Agnostic Envelope & CLI Spawner)
+### Legacy File 7: `src/dispatcher.rs` (Step 3: Harness-Agnostic Envelope & CLI Spawner)
 
 ```rust
 use crate::budget::BudgetEvaluation;
@@ -833,7 +1068,7 @@ pub fn execute_dispatch(envelope: &RouterEnvelope) -> Result<i32, String> {
 }
 ```
 
-### File 8: `src/hook.rs` (Step 3 Mode C: Zero-Dependency Lifecycle Hook Adapter)
+### Legacy File 8: `src/hook.rs` (Step 3 Mode C: Zero-Dependency Lifecycle Hook Adapter)
 
 Implements synchronous stdin/stdout lifecycle hook handling (`agent-router --hook`) for VS Code GitHub Copilot, Claude Code, and Antigravity (AGY).
 
@@ -1082,7 +1317,7 @@ pub fn run_stdio_hook(default_repo_root: &Path) -> io::Result<()> {
 }
 ```
 
-### File 9: `src/main.rs` (CLI Entrypoint & Pipeline Orchestrator)
+### Legacy File 9: `src/main.rs` (CLI Entrypoint & Pipeline Orchestrator)
 
 ```rust
 mod budget;
@@ -1255,7 +1490,11 @@ fn main() {
 }
 ```
 
-## 5. Step-by-Step Build & Verification Sequence
+## 7. Historical: v0.3.0 Step-by-Step Build & Verification Sequence
+
+The v2 command sequence is §5 above; the transcript below is kept as the original single-package
+runbook (its `cargo test` / `cargo run` invocations are shorthand for `cargo test --workspace` and
+`cargo run -p agent-router`).
 
 ### 1. Scaffold and Verify Unit Tests
 
