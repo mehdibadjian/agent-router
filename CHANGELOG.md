@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.0.0](https://github.com/mehdibadjian/agent-router/compare/v0.3.0...v2.0.0) (2026-10-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* repository topology changes from a single package to a Cargo workspace (crates/s1s2-core, crates/ext-agent-router, bins/agent-router). The public CLI, hook, JSON envelope, ROUTED_* env, and .router/ state contracts are unchanged; the new surface is additive.
+
+### Features
+
+* extract s1s2 cognitive engine into a reusable workspace ([#9](https://github.com/mehdibadjian/agent-router/issues/9)) ([de31907](https://github.com/mehdibadjian/agent-router/commit/de3190757b2563e3d0c1c769ec4be6a67dac96c0))
+
 ## [0.3.0](https://github.com/mehdibadjian/agent-router/compare/v0.2.2...v0.3.0) (2026-10-18)
 
 
