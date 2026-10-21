@@ -4,13 +4,12 @@ version = 4
 
 [[package]]
 name = "agent-router"
-version = "0.3.0"
+version = "2.0.0"
 dependencies = [
+ "ext-agent-router",
+ "s1s2-core",
  "serde",
  "serde_json",
- "ureq",
- "walkdir",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -44,6 +43,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "ext-agent-router"
+version = "2.0.0"
+dependencies = [
+ "s1s2-core",
+ "serde",
+ "serde_json",
+ "walkdir",
 ]
 
 [[package]]
@@ -292,6 +301,17 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "untrusted",
+]
+
+[[package]]
+name = "s1s2-core"
+version = "2.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "ureq",
+ "walkdir",
+ "xxhash-rust",
 ]
 
 [[package]]

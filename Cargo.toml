@@ -1,14 +1,28 @@
-[package]
-name = "agent-router"
-version = "0.3.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = [
+    "crates/s1s2-core",
+    "crates/ext-agent-router",
+    "bins/agent-router",
+]
 
-[dependencies]
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+repository = "https://github.com/mehdibadjian/agent-router"
+
+# Allowed dependency set (spec §2): no async runtime, no OpenSSL/C bindings.
+[workspace.dependencies]
 serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.128"
-ureq = { version = "2.10.1", default-features = false, features = ["tls", "json"] }
-xxhash-rust = { version = "0.8.12", features = ["xxh3"] }
+xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
 walkdir = "2.5.0"
+ureq = { version = "2.10.1", default-features = false, features = ["tls", "json"] }
+
+# Workspace-internal path dependencies carry no version: the release tooling bumps a
+# single field, `[workspace.package].version`, and every member inherits it.
+s1s2-core = { path = "crates/s1s2-core" }
+ext-agent-router = { path = "crates/ext-agent-router" }
 
 [profile.release]
 opt-level = "z"
